@@ -327,3 +327,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-596 -->
 - #596: Add Infrastructure as Code (IaC)
+
+<!-- handsoff-issue-863 -->
+- #863: Notification Preferences Live Only in Memory
