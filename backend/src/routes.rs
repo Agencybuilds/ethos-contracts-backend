@@ -74,7 +74,11 @@ pub async fn set_preferences(
     }
 
     // #825: Idempotency key support
-    if let Some(idem_key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
+    let idem_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(idem_key) = idem_key {
         if let Some(cached) = db.check_idempotency(idem_key) {
             // #858: A corrupt cached body must not panic the request task.
             // Log the error, evict the bad record so the next request
@@ -103,15 +107,21 @@ pub async fn set_preferences(
         frequency: body.frequency,
         deleted_at: None,
     };
-    db.upsert(&prefs)?;
+
+    // #859: Store the idempotency key in the same transaction as the mutation
+    // so concurrent requests with the same key cannot both run the mutation.
+    // A unique constraint on the key makes the duplicate insert fail, and the
+    // error is propagated instead of being discarded.
+    match idem_key {
+        Some(idem_key) => {
+            let body_json = serde_json::to_string(&prefs).map_err(|_| AppError::DatabaseError)?;
+            db.upsert_with_idempotency(&prefs, idem_key, 200, &body_json)?;
+        }
+        None => db.upsert(&prefs)?,
+    }
+
     state.query_cache.invalidate_preferences(&vault_id.to_string());
     state.query_cache.invalidate_vault(&vault_id.to_string());
-
-    // Store idempotency record if key was provided
-    if let Some(idem_key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
-        let body_json = serde_json::to_string(&prefs).unwrap();
-        db.store_idempotency(idem_key, 200, &body_json);
-    }
 
     Ok((StatusCode::OK, Json(prefs)))
 }
@@ -230,33 +240,6 @@ pub async fn create_tenant(
     Json(body): Json<crate::models::CreateTenantRequest>,
 ) -> Result<(StatusCode, Json<crate::models::Tenant>), AppError> {
     let tenant = crate::models::Tenant {
-        id: uuid::Uuid::new_v4().to_string(),
-        name: body.name,
-        owner: body.owner,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-        is_active: true,
-    };
-    state
-        .db
-        .create_tenant(&tenant)
-        .map_err(|_| AppError::DatabaseError)?;
-    state.query_cache.invalidate_tenant(&tenant.id);
-    Ok((StatusCode::CREATED, Json(tenant)))
-}
+        id: uuid::Uuid::new_v4(
 
-pub async fn get_tenant_vaults(
-    State(state): State<Arc<AppState>>,
-    Path(tenant_id): Path<String>,
-) -> Result<Json<Vec<String>>, AppError> {
-    let vaults = state
-        .db
-        .get_tenant_vaults(&tenant_id)
-        .map_err(|_| AppError::DatabaseError)?;
-    Ok(Json(vaults))
-}
-
-pub async fn add_vault_to_tenant(
-    State(sta
-
-/* … truncated 5023 chars — edit only what you need near the top … */
+/* … truncated 796 chars — edit only what you need near the top … */
