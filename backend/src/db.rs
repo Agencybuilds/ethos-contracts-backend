@@ -90,6 +90,8 @@ pub struct AppState {
     /// consensus reconciliation job (#373), so a conflict opens the same
     /// kind of record a manually-filed incident would.
     pub incident_state: Arc<crate::incidents::IncidentState>,
+    /// Persistent bulk-operation jobs.
+    pub job_store: crate::jobs::JobStore,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -131,6 +133,12 @@ impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
 impl axum::extract::FromRef<AppState> for Arc<crate::incidents::IncidentState> {
     fn from_ref(state: &AppState) -> Arc<crate::incidents::IncidentState> {
         Arc::clone(&state.incident_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for crate::jobs::JobStore {
+    fn from_ref(state: &AppState) -> crate::jobs::JobStore {
+        state.job_store.clone()
     }
 }
 

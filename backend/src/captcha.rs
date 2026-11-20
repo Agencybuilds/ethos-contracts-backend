@@ -602,6 +602,7 @@ mod tests {
             flag_state,
             query_cache: Arc::new(QueryCache::new()),
             deadlock_detector: Arc::new(DeadlockDetector::new()),
+            job_store: crate::jobs::create_job_store(),
         }
     }
 

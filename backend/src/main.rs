@@ -38,6 +38,10 @@ use ethos_protocol_backend::{
     event_sourcing::EventSourcingState,
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
+    jobs::{
+        self, cancel_job_handler, create_job_handler, get_job_handler, list_jobs_handler,
+        JobStatus,
+    },
     load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
     message_queue::MessageQueueState,
     metrics::Metrics,
@@ -165,6 +169,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
         .route("/metrics", get(metrics_handler))
+        // ── Persistent bulk jobs ────────────────────────────────────────────
+        .route("/jobs", post(create_job_handler).get(list_jobs_handler))
+        .route(
+            "/jobs/:job_id",
+            get(get_job_handler).delete(cancel_job_handler),
+        )
         // ── Graceful degradation routes ─────────────────────────────────────
         .route(
             "/admin/capabilities",
@@ -306,6 +316,15 @@ async fn main() {
         Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
     db.migrate().expect("migration failed");
 
+    let job_db_path =
+        std::env::var("JOB_QUEUE_DB_PATH").unwrap_or_else(|_| "jobs.sqlite3".to_string());
+    let job_store = jobs::open_job_store(&job_db_path).expect("failed to open bulk job store");
+    for job in jobs::list_jobs(&job_store, Some(JobStatus::Queued))
+        .expect("failed to load queued jobs")
+    {
+        jobs::spawn_job(job_store.clone(), job.id);
+    }
+
     // Keep sampler and rpc_pool alive for the duration of the process.
     // They are logged at startup; full integration into AppState is done when
     // handlers need them directly.
@@ -379,6 +398,7 @@ async fn main() {
         flag_state,
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
+        job_store,
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────
