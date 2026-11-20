@@ -333,3 +333,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-849 -->
 - #849: A Corrupt `created_at` Timestamp Silently Becomes "Now"
+
+<!-- handsoff-issue-850 -->
+- #850: An Unparseable Balance Silently Becomes Zero
