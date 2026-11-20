@@ -330,3 +330,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-847 -->
 - #847: `get_vault` Reports Database Errors as "Not Found"
+
+<!-- handsoff-issue-874 -->
+- #874: Unsubscribe Token Write Errors Are Discarded
