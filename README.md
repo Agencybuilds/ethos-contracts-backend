@@ -327,3 +327,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-596 -->
 - #596: Add Infrastructure as Code (IaC)
+
+<!-- handsoff-issue-848 -->
+- #848: A Corrupt `last_check_in` Timestamp Silently Becomes "Now"
