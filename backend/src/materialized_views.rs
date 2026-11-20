@@ -45,7 +45,18 @@ pub struct VaultSummaryView {
     /// Average check-in interval across all vaults, or 0.0 when no vaults exist.
     pub avg_check_in_interval: f64,
     /// Timestamp of the last full refresh.
-    pub last_refreshed_at: DateTime<Utc>,
+    ///
+    /// `None` when the stored refresh time could not be parsed; callers must
+    /// treat such a summary as stale rather than fresh (Issue #853).
+    pub last_refreshed_at: Option<DateTime<Utc>>,
+}
+
+impl VaultSummaryView {
+    /// Whether the summary's stored refresh time could not be parsed and the
+    /// summary should therefore be treated as stale (Issue #853).
+    pub fn is_stale(&self) -> bool {
+        self.last_refreshed_at.is_none()
+    }
 }
 
 /// Per-owner vault counts, stored in the `vault_owner_counts_view` auxiliary
@@ -140,6 +151,10 @@ impl Db {
             return Err(rusqlite::Error::InvalidQuery);
         }
 
+        // Capture the refresh time on the write path so the read path never
+        // has to synthesize a timestamp (Issue #853).
+        let refreshed_at = Utc::now().to_rfc3339();
+
         conn.execute(
             r"
             INSERT OR REPLACE INTO vault_summary_view
@@ -154,7 +169,7 @@ impl Db {
                 expired_vaults,
                 total_balance.to_string(),
                 avg_check_in_interval,
-                Utc::now().to_rfc3339(),
+                refreshed_at,
             ],
         )?;
         Ok(())
@@ -186,6 +201,8 @@ impl Db {
         released_delta: i64,
         expired_delta: i64,
     ) -> Result<(), rusqlite::Error> {
+        // Record the refresh time on the write path (Issue #853).
+        let refreshed_at = Utc::now().to_rfc3339();
         self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"
             UPDATE vault_summary_view
@@ -202,90 +219,9 @@ impl Db {
                 active_delta,
                 released_delta,
                 expired_delta,
-                Utc::now().to_rfc3339(),
+                refreshed_at,
             ],
         )?;
         Ok(())
-    }
-
-    /// Read the vault summary from the materialized view.
-    pub fn mv_get_vault_summary(&self) -> Option<VaultSummaryView> {
-        let binding = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let mut stmt = binding
-            .prepare(
-                r"SELECT total_vaults, active_vaults, released_vaults, expired_vaults,
-                         total_balance_text, avg_check_in_interval, last_refreshed_at
-                  FROM vault_summary_view
-                  WHERE id = 1",
-            )
-            .ok()?;
-
-        stmt.query_row([], |row| {
-            let balance_str: String = row.get(4)?;
-            let last_refreshed_str: String = row.get(6)?;
-            let last_refreshed_at =
-                chrono::DateTime::parse_from_rfc3339(&last_refreshed_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-            let (total_balance, unparseable_balance_rows) =
-                match balance_str.trim().parse::<i128>() {
-                    Ok(v) => (v, 0),
-                    Err(_) => {
-                        eprintln!(
-                            "materialized_views: stored total_balance {balance_str:?} is unparseable; reporting 0"
-                        );
-                        (0, 1)
-                    }
-                };
-            Ok(VaultSummaryView {
-                total_vaults: row.get(0)?,
-                active_vaults: row.get(1)?,
-                released_vaults: row.get(2)?,
-                expired_vaults: row.get(3)?,
-                total_balance,
-                unparseable_balance_rows,
-                avg_check_in_interval: row.get::<_, f64>(5).unwrap_or(0.0),
-                last_refreshed_at,
-            })
-        })
-        .ok()
-    }
-
-    /// Read per-owner vault counts from the materialized view.
-    pub fn mv_get_owner_counts(&self) -> Vec<VaultOwnerCount> {
-        let binding = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let mut stmt = match binding.prepare(
-            "SELECT owner, vault_count, active_count \
-             FROM vault_owner_counts_view ORDER BY vault_count DESC",
-        ) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-
-        stmt.query_map([], |row| {
-            Ok(VaultOwnerCount {
-                owner: row.get(0)?,
-                vault_count: row.get(1)?,
-                active_count: row.get(2)?,
-            })
-        })
-        .map(|rows| rows.filter_map(Result::ok).collect())
-        .unwrap_or_default()
-    }
-
-    /// Emit EXPLAIN QUERY PLAN rows for the given SQL string.
-    /// Used by `OptimizedQueryRunner::explain_plan`.
-    pub fn explain_query_plan(&self, sql: &str) -> Vec<String> {
-        let explain = format!("EXPLAIN QUERY PLAN {sql}");
-        let binding = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let mut stmt = match binding.prepare(&explain) {
-            Ok(s) => s,
-            Err(e) => return vec![format!("error: {e}")],
-        };
-        let rows = stmt.query_map([], |row| row.get::<_, String>(3));
-        match rows {
-            Ok(iter) => iter.filter_map(Result::ok).collect(),
-            Err(e) => vec![format!("error: {e}")],
-        }
     }
 }
