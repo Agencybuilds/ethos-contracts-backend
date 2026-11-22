@@ -271,6 +271,67 @@ fn extract_user_id(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+/// Compute a tamper-evident checkpoint hash for a retention purge (#875).
+///
+/// The hash covers the purge cutoff, the number of purged rows, and the
+/// per-row digests of the purged entries so an auditor can verify that a gap
+/// in `audit_logs` corresponds to a recorded retention purge rather than
+/// tampering. The result is a hex-encoded SHA-256 digest.
+pub fn purge_checkpoint_hash(
+    cutoff: &str,
+    purged_count: usize,
+    purged_digests: &[String],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"audit-purge-checkpoint-v1");
+    hasher.update(cutoff.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(purged_count.to_string().as_bytes());
+    for digest in purged_digests {
+        hasher.update(b"\x1e");
+        hasher.update(digest.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Build a stable per-row digest for a purged audit entry (#875).
+///
+/// Used as input to [`purge_checkpoint_hash`] so the checkpoint commits to the
+/// exact set of purged rows.
+pub fn audit_entry_digest(entry: &AuditLogEntry) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(entry.id.to_string().as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(entry.timestamp.to_rfc3339().as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(entry.user_id.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(entry.action.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(entry.resource.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(entry.result.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(entry.ip_address.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
