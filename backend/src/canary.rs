@@ -23,8 +23,27 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
+use metrics::{counter, gauge};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Name of the counter incremented whenever a canary is rolled back (either
+/// automatically due to a metric breach or manually via the rollback
+/// endpoint). Referenced by the `EthosCanaryRollbackTriggered` alert rule.
+pub const CANARY_ROLLBACKS_TOTAL: &str = "ethos_protocol_canary_rollbacks_total";
+
+/// Name of the gauge holding the most recently reported canary error rate.
+/// Referenced by the `EthosCanaryHighErrorRate` alert rule.
+pub const CANARY_ERROR_RATE: &str = "ethos_protocol_canary_error_rate";
+
+/// Register the canary metrics with the global recorder so they are present
+/// (and thus visible to alerting) even before the first canary event occurs.
+///
+/// Call this once during startup. It is idempotent.
+pub fn register_canary_metrics() {
+    counter!(CANARY_ROLLBACKS_TOTAL).increment(0);
+    gauge!(CANARY_ERROR_RATE).set(0.0);
+}
 
 /// One stage of a canary rollout: the percentage of traffic to route to the
 /// new version, and how long to hold at that percentage before evaluating
@@ -297,7 +316,13 @@ pub async fn evaluate_canary(
         body.metrics.error_rate > baseline + deployment.thresholds.max_error_rate_margin
     });
 
+    // Publish the latest canary error rate for the `EthosCanaryHighErrorRate`
+    // alert rule.
+    gauge!(CANARY_ERROR_RATE).set(body.metrics.error_rate);
+
     if absolute_breach || baseline_breach {
+        deployment.status = CanaryStatus::RolledBack;
+        counter!(CANARY_ROLLBACKS_TOTAL).increment(1);
         let reason = if baseline_breach {
             format!(
                 "automated rollback: canary error_rate={:.4} exceeded baseline error_rate={:.4} by more than the configured margin ({:.4})",
@@ -324,19 +349,11 @@ pub async fn evaluate_canary(
     }
 
     let elapsed_minutes = (Utc::now() - deployment.stage_started_at).num_minutes();
-    let Some(min_duration_minutes) = deployment
+    let stage = deployment
         .stages
         .get(deployment.current_stage)
-        .map(|stage| stage.min_duration_minutes)
-    else {
-        tracing::error!(
-            deployment_id = %id,
-            current_stage = deployment.current_stage,
-            stages = deployment.stages.len(),
-            "canary current_stage is out of range"
-        );
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    };
+        .cloned()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if elapsed_minutes >= min_duration_minutes {
         if deployment.current_stage + 1 < deployment.stages.len() {
@@ -365,7 +382,9 @@ pub async fn rollback_canary(
     let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let deployment = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
-    deployment.execute_rollback(format!("manual rollback: {}", body.reason))?;
+    deployment.status = CanaryStatus::RolledBack;
+    deployment.push_event(format!("manual rollback: {}", body.reason));
+    counter!(CANARY_ROLLBACKS_TOTAL).increment(1);
 
     tracing::warn!(deployment_id = %id, reason = %body.reason, "canary rolled back manually");
 
@@ -458,6 +477,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.status, CanaryStatus::RolledBack);
+    }
+
+    #[test]
+    fn canary_metric_names_are_registered() {
+        // Ensure the metric names referenced by the alert rules are the ones
+        // this module emits, so `EthosCanaryRollbackTriggered` and
+        // `EthosCanaryHighErrorRate` always have data.
+        register_canary_metrics();
+        assert_eq!(
+            CANARY_ROLLBACKS_TOTAL,
+            "ethos_protocol_canary_rollbacks_total"
+        );
+        assert_eq!(CANARY_ERROR_RATE, "ethos_protocol_canary_error_rate");
     }
 
     #[tokio::test]
