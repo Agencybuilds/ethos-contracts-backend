@@ -108,7 +108,12 @@ pub struct FcmClient {
 impl FcmClient {
     pub fn new(server_key: String, project_id: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            // Bounded so a stalled provider cannot hold a worker open (#903).
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("FCM HTTP client with timeouts"),
             server_key,
             project_id,
             base_url: "https://fcm.googleapis.com".to_string(),
@@ -321,6 +326,8 @@ pub struct NotificationService {
     pub unsubscribe_tokens: UnsubscribeStore,
     pub channel_delivery_log: ChannelDeliveryStore,
     pub idempotency: IdempotencyStore,
+    /// Notifications that exhaust their retry budget are routed here (#877).
+    pub dlq_state: Arc<crate::dlq::DlqState>,
     clock: Arc<dyn Clock>,
 }
 
@@ -459,6 +466,7 @@ impl NotificationService {
             unsubscribe_tokens: create_unsubscribe_store(),
             channel_delivery_log: create_channel_delivery_store(),
             idempotency: create_idempotency_store(),
+            dlq_state: Arc::new(crate::dlq::DlqState::new()),
             clock,
         }
     }
@@ -849,6 +857,14 @@ impl NotificationService {
                 log::error!(
                     "[ALERT] Reminder delivery permanently failed after {} attempts: vault={} owner={} error={}",
                     next_attempt, notif.vault_id, notif.owner, last_err
+                );
+                crate::dlq::route_to_dlq(
+                    &self.dlq_state,
+                    "notifications",
+                    Some(notif.owner.clone()),
+                    json!({ "notification_id": notif.id, "vault_id": notif.vault_id }),
+                    last_err.clone(),
+                    next_attempt,
                 );
             }
         }
