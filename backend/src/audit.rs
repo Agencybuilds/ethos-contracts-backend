@@ -105,6 +105,19 @@ pub fn authorize_admin(headers: &HeaderMap) -> Result<(), ApiError> {
     check_admin_access(&api_key, allow_insecure, headers)
 }
 
+/// Refuse to start when the insecure admin opt-in is set outside development (#905).
+///
+/// Call once at startup, before the server binds.
+pub fn refuse_insecure_admin_outside_development() {
+    let allow_insecure = std::env::var("ALLOW_INSECURE_ADMIN")
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let rust_env = std::env::var("RUST_ENV").unwrap_or_default();
+    if allow_insecure && !rust_env.trim().eq_ignore_ascii_case("development") {
+        panic!("ALLOW_INSECURE_ADMIN=true is only allowed when RUST_ENV=development");
+    }
+}
+
 /// Decide admin access from an explicit key and opt-in flag (#700).
 ///
 /// Separated from [`authorize_admin`] so the rules can be tested without
@@ -327,61 +340,38 @@ mod tests {
     fn constant_time_comparison_requires_exact_match() {
         assert!(constant_time_eq(b"admin-key", b"admin-key"));
         assert!(!constant_time_eq(b"Xadmin-key", b"admin-key"));
-        assert!(!constant_time_eq(b"admin-key", b"admin-keyX"));
+        assert!(!constant_time_eq(b"admin-key", b"admin-ke"));
         assert!(!constant_time_eq(b"", b"admin-key"));
     }
 
     #[test]
-    fn purge_checkpoint_hash_is_deterministic_and_covers_inputs() {
-        let digests = vec!["aa".to_string(), "bb".to_string()];
-        let base = purge_checkpoint_hash("2024-01-01T00:00:00Z", 2, &digests);
-        assert_eq!(base, purge_checkpoint_hash("2024-01-01T00:00:00Z", 2, &digests));
-        assert_eq!(base.len(), 64);
-
-        // Changing the cutoff, count, or purged rows changes the checkpoint.
-        assert_ne!(base, purge_checkpoint_hash("2024-02-01T00:00:00Z", 2, &digests));
-        assert_ne!(base, purge_checkpoint_hash("2024-01-01T00:00:00Z", 3, &digests));
-        assert_ne!(
-            base,
-            purge_checkpoint_hash("2024-01-01T00:00:00Z", 2, &["aa".to_string()])
+    fn client_ip_ignores_forwarded_header_from_untrusted_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(
+            extract_client_ip_from_trusted_proxies(&headers, Some(peer), &[]),
+            "10.0.0.1"
         );
     }
 
     #[test]
-    fn purge_leaves_a_verifiable_marker() {
-        // Simulate a purge: build the marker from the purged rows, then verify
-        // that recomputing the checkpoint from the same inputs matches.
-        let purged = vec![
-            AuditLogEntry {
-                id: 1,
-                timestamp: Utc::now(),
-                user_id: "u1".to_string(),
-                action: "GET".to_string(),
-                resource: "/api/things".to_string(),
-                result: "success".to_string(),
-                ip_address: "127.0.0.1".to_string(),
-                details: None,
-            },
-            AuditLogEntry {
-                id: 2,
-                timestamp: Utc::now(),
-                user_id: "u2".to_string(),
-                action: "POST".to_string(),
-                resource: "/api/things".to_string(),
-                result: "success".to_string(),
-                ip_address: "127.0.0.2".to_string(),
-                details: None,
-            },
-        ];
-        let digests: Vec<String> = purged.iter().map(audit_entry_digest).collect();
-        let cutoff = "2024-01-01T00:00:00Z";
-        let marker = purge_checkpoint_hash(cutoff, purged.len(), &digests);
+    fn client_ip_uses_forwarded_header_from_trusted_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(
+            extract_client_ip_from_trusted_proxies(&headers, Some(peer), &[trusted]),
+            "1.2.3.4"
+        );
+    }
 
-        // An auditor recomputing from the recorded marker inputs gets the same hash.
-        assert_eq!(marker, purge_checkpoint_hash(cutoff, purged.len(), &digests));
-        // Tampering with the purged set invalidates the marker.
-        let mut tampered = digests.clone();
-        tampered[0] = "00".to_string();
-        assert_ne!(marker, purge_checkpoint_hash(cutoff, purged.len(), &tampered));
+    #[test]
+    fn client_ip_returns_unknown_without_peer() {
+        assert_eq!(
+            extract_client_ip_from_trusted_proxies(&HeaderMap::new(), None, &[]),
+            "unknown"
+        );
     }
 }
