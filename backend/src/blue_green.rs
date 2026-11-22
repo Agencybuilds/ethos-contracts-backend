@@ -42,6 +42,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::metrics::Metrics;
+
 // ── Domain types ──────────────────────────────────────────────────────────────
 
 /// Which slot is currently active (receiving live traffic).
@@ -149,6 +151,55 @@ impl BlueGreenDeployment {
             ActiveSlot::Green => &self.blue,
         }
     }
+
+    /// Route all traffic to `slot`.
+    fn route_traffic_to(&mut self, slot: ActiveSlot) {
+        self.active_slot = slot;
+        let (blue, green) = match slot {
+            ActiveSlot::Blue => (1.0, 0.0),
+            ActiveSlot::Green => (0.0, 1.0),
+        };
+        self.blue.traffic_weight = blue;
+        self.green.traffic_weight = green;
+    }
+
+    /// Revert traffic to the standby slot and return `(from, to)`.
+    ///
+    /// A second rollback would send traffic back to the slot that was just
+    /// rolled away from, so it is refused and the caller must handle it.
+    #[must_use = "a rollback that did not happen must be reported to the caller"]
+    pub fn execute_rollback(
+        &mut self,
+        reason: &str,
+    ) -> Result<(ActiveSlot, ActiveSlot), BlueGreenRollbackError> {
+        if self.status == BlueGreenStatus::RolledBack {
+            return Err(BlueGreenRollbackError::AlreadyRolledBack);
+        }
+
+        let current_active = self.active_slot;
+        let rollback_to = current_active.opposite();
+        self.route_traffic_to(rollback_to);
+        self.status = BlueGreenStatus::RolledBack;
+        self.push_event(format!(
+            "rollback: reverted from {current_active} to {rollback_to}; reason: {reason}"
+        ));
+        Ok((current_active, rollback_to))
+    }
+}
+
+/// Why a blue-green rollback could not be executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BlueGreenRollbackError {
+    #[error("deployment has already been rolled back")]
+    AlreadyRolledBack,
+}
+
+impl From<BlueGreenRollbackError> for StatusCode {
+    fn from(error: BlueGreenRollbackError) -> Self {
+        match error {
+            BlueGreenRollbackError::AlreadyRolledBack => StatusCode::CONFLICT,
+        }
+    }
 }
 
 /// A single historical event in a blue-green deployment's lifecycle.
@@ -165,12 +216,20 @@ pub type BlueGreenStore = Arc<Mutex<HashMap<String, BlueGreenDeployment>>>;
 #[derive(Clone)]
 pub struct BlueGreenState {
     pub store: BlueGreenStore,
+    pub metrics: Arc<Metrics>,
 }
 
 impl BlueGreenState {
     pub fn new() -> Self {
+        Self::with_metrics(Arc::new(Metrics::new()))
+    }
+
+    /// Construct state sharing an existing metrics registry so blue-green
+    /// metrics are exposed alongside the rest of the service's metrics.
+    pub fn with_metrics(metrics: Arc<Metrics>) -> Self {
         Self {
             store: Arc::new(Mutex::new(HashMap::new())),
+            metrics,
         }
     }
 }
@@ -358,17 +417,7 @@ pub async fn switch_traffic(
     ));
 
     // Perform the switch atomically.
-    deployment.active_slot = new_active;
-    match new_active {
-        ActiveSlot::Blue => {
-            deployment.blue.traffic_weight = 1.0;
-            deployment.green.traffic_weight = 0.0;
-        }
-        ActiveSlot::Green => {
-            deployment.green.traffic_weight = 1.0;
-            deployment.blue.traffic_weight = 0.0;
-        }
-    }
+    deployment.route_traffic_to(new_active);
     deployment.status = BlueGreenStatus::Stable;
     deployment.push_event(format!(
         "traffic switched to {new_active}; {previous_active} is now standby"
@@ -395,25 +444,14 @@ pub async fn rollback_blue_green(
     let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let deployment = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
-    let current_active = deployment.active_slot;
-    let rollback_to = current_active.opposite();
+    let (current_active, rollback_to) = deployment.execute_rollback(&body.reason)?;
 
-    deployment.active_slot = rollback_to;
-    match rollback_to {
-        ActiveSlot::Blue => {
-            deployment.blue.traffic_weight = 1.0;
-            deployment.green.traffic_weight = 0.0;
-        }
-        ActiveSlot::Green => {
-            deployment.green.traffic_weight = 1.0;
-            deployment.blue.traffic_weight = 0.0;
-        }
-    }
-    deployment.status = BlueGreenStatus::RolledBack;
-    deployment.push_event(format!(
-        "rollback: reverted from {current_active} to {rollback_to}; reason: {}",
-        body.reason
-    ));
+    let service = deployment.service.clone();
+    state
+        .metrics
+        .bluegreen_rollbacks_total
+        .with_label_values(&[service.as_str()])
+        .inc();
 
     tracing::warn!(
         deployment_id = %id,
@@ -445,6 +483,14 @@ pub async fn report_health(
     slot.last_health_check = Some(now);
     deployment.updated_at = now;
 
+    let service = deployment.service.clone();
+    let slot_name = body.slot.to_string();
+    state
+        .metrics
+        .bluegreen_slot_health
+        .with_label_values(&[service.as_str(), slot_name.as_str()])
+        .set(slot_health_metric_value(body.health));
+
     // If the active slot is now unhealthy, mark the overall deployment as unhealthy.
     let active_health = deployment.active().health;
     if active_health == SlotHealth::Unhealthy {
@@ -461,6 +507,15 @@ pub async fn report_health(
     }
 
     Ok(Json(deployment.clone()))
+}
+
+/// Map a [`SlotHealth`] to the numeric value exported via
+/// `ethos_protocol_bluegreen_slot_health` (1 = healthy, 0 = otherwise).
+fn slot_health_metric_value(health: SlotHealth) -> f64 {
+    match health {
+        SlotHealth::Healthy => 1.0,
+        SlotHealth::Unknown | SlotHealth::Degraded | SlotHealth::Unhealthy => 0.0,
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -640,5 +695,64 @@ mod tests {
     fn active_slot_opposite() {
         assert_eq!(ActiveSlot::Blue.opposite(), ActiveSlot::Green);
         assert_eq!(ActiveSlot::Green.opposite(), ActiveSlot::Blue);
+    }
+
+    #[tokio::test]
+    async fn health_report_and_rollback_emit_metrics() {
+        let state = Arc::new(BlueGreenState::new());
+        let d = create_deployment(&state).await;
+
+        let _ = report_health(
+            State(Arc::clone(&state)),
+            Path(d.id.clone()),
+            Json(ReportHealthRequest {
+                slot: ActiveSlot::Green,
+                health: SlotHealth::Healthy,
+                details: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let _ = report_health(
+            State(Arc::clone(&state)),
+            Path(d.id.clone()),
+            Json(ReportHealthRequest {
+                slot: ActiveSlot::Blue,
+                health: SlotHealth::Unhealthy,
+                details: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let _ = rollback_blue_green(
+            State(Arc::clone(&state)),
+            Path(d.id.clone()),
+            Json(RollbackBlueGreenRequest { reason: "test".into() }),
+        )
+        .await
+        .unwrap();
+
+        let rendered = state.metrics.render();
+
+        assert!(
+            rendered.contains(
+                "ethos_protocol_bluegreen_slot_health{service=\"vault-api\",slot=\"green\"} 1"
+            ),
+            "expected healthy green slot metric, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "ethos_protocol_bluegreen_slot_health{service=\"vault-api\",slot=\"blue\"} 0"
+            ),
+            "expected unhealthy blue slot metric, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "ethos_protocol_bluegreen_rollbacks_total{service=\"vault-api\"} 1"
+            ),
+            "expected rollback counter, got:\n{rendered}"
+        );
     }
 }

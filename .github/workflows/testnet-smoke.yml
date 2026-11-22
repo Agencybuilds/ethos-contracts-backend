@@ -24,14 +24,14 @@ jobs:
       issues: write
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Pinned (not @stable): see ci.yml for the ethnum/E0512 rationale.
       - uses: dtolnay/rust-toolchain@3f2778ee6a28c53e512b95bbcf7b2120993da70d # 1.96.1
         with:
           targets: wasm32-unknown-unknown
 
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -55,14 +55,19 @@ jobs:
       # Generate per-run key names so parallel runs don't collide in the
       # local stellar-cli config store.
       - name: Set up test accounts
+        # Secrets go through env, not into the script text, so they never show
+        # up in the step's written commands or in `set -x` output (#909).
+        env:
+          TESTNET_ADMIN_SECRET: ${{ secrets.TESTNET_ADMIN_SECRET }}
+          TESTNET_OWNER_SECRET: ${{ secrets.TESTNET_OWNER_SECRET }}
         run: |
           set -euo pipefail
           SUFFIX="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           # --- Admin: deploys and initializes the contract ---
-          if [ -n "${{ secrets.TESTNET_ADMIN_SECRET }}" ]; then
+          if [ -n "${TESTNET_ADMIN_SECRET:-}" ]; then
             stellar keys add "smoke-admin-${SUFFIX}" \
-              --secret-key "${{ secrets.TESTNET_ADMIN_SECRET }}"
+              --secret-key "$TESTNET_ADMIN_SECRET"
           else
             stellar keys generate "smoke-admin-${SUFFIX}" --network testnet
           fi
@@ -71,9 +76,9 @@ jobs:
           sleep 5
 
           # --- Owner: create_vault / deposit / check_in / cancel_vault ---
-          if [ -n "${{ secrets.TESTNET_OWNER_SECRET }}" ]; then
+          if [ -n "${TESTNET_OWNER_SECRET:-}" ]; then
             stellar keys add "smoke-owner-${SUFFIX}" \
-              --secret-key "${{ secrets.TESTNET_OWNER_SECRET }}"
+              --secret-key "$TESTNET_OWNER_SECRET"
           else
             stellar keys generate "smoke-owner-${SUFFIX}" --network testnet
           fi
@@ -116,7 +121,7 @@ jobs:
           EOF
           cat smoke-results/contract.txt
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: smoke-test-${{ github.run_id }}
           path: smoke-results/
@@ -228,7 +233,7 @@ jobs:
       # issue for repeated failures so the tracker stays clean.
       - name: Alert — file failure issue
         if: failure()
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
