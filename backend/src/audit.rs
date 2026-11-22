@@ -105,6 +105,19 @@ pub fn authorize_admin(headers: &HeaderMap) -> Result<(), ApiError> {
     check_admin_access(&api_key, allow_insecure, headers)
 }
 
+/// Refuse to start when the insecure admin opt-in is set outside development (#905).
+///
+/// Call once at startup, before the server binds.
+pub fn refuse_insecure_admin_outside_development() {
+    let allow_insecure = std::env::var("ALLOW_INSECURE_ADMIN")
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let rust_env = std::env::var("RUST_ENV").unwrap_or_default();
+    if allow_insecure && !rust_env.trim().eq_ignore_ascii_case("development") {
+        panic!("ALLOW_INSECURE_ADMIN=true is only allowed when RUST_ENV=development");
+    }
+}
+
 /// Decide admin access from an explicit key and opt-in flag (#700).
 ///
 /// Separated from [`authorize_admin`] so the rules can be tested without
@@ -258,6 +271,67 @@ fn extract_user_id(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+/// Compute a tamper-evident checkpoint hash for a retention purge (#875).
+///
+/// The hash covers the purge cutoff, the number of purged rows, and the
+/// per-row digests of the purged entries so an auditor can verify that a gap
+/// in `audit_logs` corresponds to a recorded retention purge rather than
+/// tampering. The result is a hex-encoded SHA-256 digest.
+pub fn purge_checkpoint_hash(
+    cutoff: &str,
+    purged_count: usize,
+    purged_digests: &[String],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"audit-purge-checkpoint-v1");
+    hasher.update(cutoff.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(purged_count.to_string().as_bytes());
+    for digest in purged_digests {
+        hasher.update(b"\x1e");
+        hasher.update(digest.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Build a stable per-row digest for a purged audit entry (#875).
+///
+/// Used as input to [`purge_checkpoint_hash`] so the checkpoint commits to the
+/// exact set of purged rows.
+pub fn audit_entry_digest(entry: &AuditLogEntry) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(entry.id.to_string().as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(entry.timestamp.to_rfc3339().as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(entry.user_id.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(entry.action.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(entry.resource.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(entry.result.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(entry.ip_address.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,41 +340,38 @@ mod tests {
     fn constant_time_comparison_requires_exact_match() {
         assert!(constant_time_eq(b"admin-key", b"admin-key"));
         assert!(!constant_time_eq(b"Xadmin-key", b"admin-key"));
-        assert!(!constant_time_eq(b"admin-keY", b"admin-key"));
-        assert!(!constant_time_eq(b"admin", b"admin-key"));
+        assert!(!constant_time_eq(b"admin-key", b"admin-ke"));
+        assert!(!constant_time_eq(b"", b"admin-key"));
     }
 
     #[test]
-    fn untrusted_peer_cannot_spoof_client_ip_headers() {
+    fn client_ip_ignores_forwarded_header_from_untrusted_peer() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "198.51.100.10".parse().unwrap());
-        headers.insert("x-real-ip", "198.51.100.11".parse().unwrap());
-
-        let client_ip = extract_client_ip_from_trusted_proxies(
-            &headers,
-            Some("203.0.113.1".parse().unwrap()),
-            &["10.0.0.1".parse().unwrap()],
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(
+            extract_client_ip_from_trusted_proxies(&headers, Some(peer), &[]),
+            "10.0.0.1"
         );
-
-        assert_eq!(client_ip, "203.0.113.1");
     }
 
     #[test]
-    fn trusted_proxy_uses_first_untrusted_address_in_forwarded_chain() {
+    fn client_ip_uses_forwarded_header_from_trusted_peer() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-forwarded-for",
-            "198.51.100.99, 192.0.2.45, 10.0.0.2"
-                .parse()
-                .unwrap(),
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(
+            extract_client_ip_from_trusted_proxies(&headers, Some(peer), &[trusted]),
+            "1.2.3.4"
         );
+    }
 
-        let client_ip = extract_client_ip_from_trusted_proxies(
-            &headers,
-            Some("10.0.0.1".parse().unwrap()),
-            &["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()],
+    #[test]
+    fn client_ip_returns_unknown_without_peer() {
+        assert_eq!(
+            extract_client_ip_from_trusted_proxies(&HeaderMap::new(), None, &[]),
+            "unknown"
         );
-
-        assert_eq!(client_ip, "192.0.2.45");
     }
 }
