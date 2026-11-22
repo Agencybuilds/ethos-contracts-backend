@@ -354,7 +354,7 @@ pub fn resolve_template(
     };
 
     let mut depth = 0u32;
-    let resolved_data = template.data.clone();
+    let mut resolved_data = template.data.clone();
     let mut current_id = template_id;
 
     // Walk up the inheritance chain, collecting overrides
@@ -392,15 +392,13 @@ pub fn resolve_template(
         }
     }
 
-    // Apply overrides in order (parent to child)
-    // In a real implementation, this would parse and merge the bytes
-    // For now, we concatenate them as a placeholder
+    // Apply overrides parent to child. The chain is collected child first, so
+    // walking it in reverse ends with the nearest override winning. Bytes are
+    // opaque here, so an override replaces the resolved data (#895).
     for i in (0..override_chain.len()).rev() {
-        let override_bytes = override_chain
-            .get(i)
-            .ok_or(TemplateInheritanceError::OverrideIndexOutOfBounds)?;
-        if override_bytes.is_empty() {
-            return Err(TemplateInheritanceError::MissingOverride);
+        let override_bytes = override_chain.get(i).unwrap();
+        if !override_bytes.is_empty() {
+            resolved_data = override_bytes;
         }
         // Merge override_bytes into resolved_data
         // Simplified: just extend (real impl would do proper merge)

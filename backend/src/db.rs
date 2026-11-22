@@ -994,8 +994,8 @@ impl Db {
     /// survives process restarts and is visible to every instance sharing the
     /// same SQLite file, then mirrors the write into the in-memory
     /// `vault_store` cache.
-    pub fn insert_vault(&self, vault: crate::models::Vault) {
-        let _ = self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
+    pub fn insert_vault(&self, vault: crate::models::Vault) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT OR REPLACE INTO vaults
                 (id, owner, beneficiary, balance, check_in_interval, last_check_in, created_at, status, ttl_remaining)
               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1010,11 +1010,12 @@ impl Db {
                 vault_status_to_str(&vault.status),
                 vault.ttl_remaining.map(u64::cast_signed),
             ],
-        );
+        )?;
         self.vault_store
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(vault.id.clone(), vault);
+        Ok(())
     }
 
     /// Retrieve a vault by string ID from the `vaults` table.
@@ -2194,6 +2195,54 @@ impl Db {
             params![cutoff],
         )?;
         Ok(count as u64)
+    }
+
+    /// Delete presence rows not seen within `inactive_secs` (#884).
+    pub fn purge_inactive_presence(&self, inactive_secs: i64) -> Result<u64, rusqlite::Error> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(inactive_secs)).to_rfc3339();
+        let count = self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "DELETE FROM user_presence WHERE last_seen < ?1",
+            params![cutoff],
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Delete operational transforms older than `retention_days` (#885).
+    ///
+    /// The schema has no per-collaborator acknowledgement, so retention is by
+    /// age. Drop-once-acknowledged needs an acknowledgement table first.
+    pub fn purge_old_transforms(&self, retention_days: i64) -> Result<u64, rusqlite::Error> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
+        let count = self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "DELETE FROM operational_transforms WHERE timestamp < ?1",
+            params![cutoff],
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Remove a tenant and every row that references it, in one transaction (#886).
+    ///
+    /// Returns how many tenant rows were deleted: 0 means the tenant did not exist.
+    pub fn offboard_tenant(&self, tenant_id: &str) -> Result<u64, rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM tenant_vaults WHERE tenant_id = ?1", params![tenant_id])?;
+        tx.execute("DELETE FROM tenant_billing WHERE tenant_id = ?1", params![tenant_id])?;
+        let count = tx.execute("DELETE FROM tenants WHERE id = ?1", params![tenant_id])?;
+        tx.commit()?;
+        Ok(count as u64)
+    }
+
+    /// Disable an insurance policy so it drops out of enabled-policy scans (#887).
+    ///
+    /// The schema has no expiry column, so the caller decides when a policy is
+    /// closed. Rows are kept for history instead of being deleted.
+    pub fn close_insurance_policy(&self, vault_id: u64) -> Result<bool, rusqlite::Error> {
+        let count = self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "UPDATE ttl_insurance_policies SET enabled = 0 WHERE vault_id = ?1",
+            params![vault_id.cast_signed()],
+        )?;
+        Ok(count > 0)
     }
 }
 
@@ -3828,7 +3877,7 @@ mod tests {
         {
             let db = Db::open(path_str).unwrap();
             db.migrate().unwrap();
-            db.insert_vault(vault.clone());
+            db.insert_vault(vault.clone()).unwrap();
         }
 
         // Re-open against the same file, simulating a process restart.
@@ -3862,7 +3911,7 @@ mod tests {
         db_b.migrate().unwrap();
 
         let vault = make_test_vault("shared-vault");
-        db_a.insert_vault(vault.clone());
+        db_a.insert_vault(vault.clone()).unwrap();
         let seen_by_b = db_b
             .get_vault(&vault.id)
             .expect("handle B should see a vault inserted through handle A");
@@ -3870,13 +3919,57 @@ mod tests {
 
         let mut vault2 = vault.clone();
         vault2.id = "shared-vault-2".to_string();
-        db_b.insert_vault(vault2.clone());
+        db_b.insert_vault(vault2.clone()).unwrap();
         let seen_by_a = db_a
             .get_vault(&vault2.id)
             .expect("handle A should see a vault inserted through handle B");
         assert_eq!(seen_by_a.id, vault2.id);
 
         let _ = std::fs::remove_file(path_str);
+    }
+
+    /// insert_vault must return an error when the SQLite write fails (e.g.
+    /// the database file is read-only) and must NOT update the in-memory
+    /// store in that case.
+    #[test]
+    fn test_insert_vault_returns_error_on_write_failure() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "ethos_vault_readonly_{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let path_str = path.to_str().unwrap();
+
+        // Create the database and schema while we still have write access.
+        {
+            let db = Db::open(path_str).unwrap();
+            db.migrate().unwrap();
+        }
+
+        // Remove write permission so the next execute() fails at the OS level.
+        std::fs::set_permissions(path_str, Permissions::from_mode(0o444)).unwrap();
+
+        let db = Db::open(path_str).unwrap();
+        let vault = make_test_vault("readonly-vault");
+
+        let result = db.insert_vault(vault.clone());
+
+        // Restore permissions before asserting so cleanup always runs.
+        let _ = std::fs::set_permissions(path_str, Permissions::from_mode(0o644));
+        let _ = std::fs::remove_file(path_str);
+
+        assert!(
+            result.is_err(),
+            "insert_vault should propagate the SQLite write error"
+        );
+
+        // The in-memory store must not have been updated.
+        assert!(
+            db.get_vault(&vault.id).is_none(),
+            "vault must not appear in memory when the DB write failed"
+        );
     }
 
     #[test]
@@ -3926,7 +4019,7 @@ mod tests {
         {
             let db = Db::open_with_pool_config(&path, &PoolConfig::default()).unwrap();
             db.migrate().unwrap();
-            db.insert_vault(vault.clone());
+            db.insert_vault(vault.clone()).unwrap();
         }
 
         let db = Db::open_with_pool_config(&path, &PoolConfig::default()).unwrap();
@@ -4030,5 +4123,78 @@ mod tests {
         drop(primary);
         let _ = std::fs::remove_file(replica_path);
         let _ = std::fs::remove_file(primary_path);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use chrono::Duration;
+
+    fn open_db() -> Db {
+        let path = std::env::temp_dir().join(format!("ethos_retention_{}.sqlite3", uuid::Uuid::new_v4()));
+        let db = Db::open(path.to_str().unwrap()).unwrap();
+        db.migrate().unwrap();
+        db
+    }
+
+    #[test]
+    fn purge_inactive_presence_keeps_recent_rows() {
+        let db = open_db();
+        let now = chrono::Utc::now();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_presence (user_id, vault_id, status, last_seen, session_id) VALUES ('stale', 'v1', 'online', ?1, 's1')",
+            params![(now - Duration::hours(2)).to_rfc3339()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO user_presence (user_id, vault_id, status, last_seen, session_id) VALUES ('fresh', 'v1', 'online', ?1, 's2')",
+            params![now.to_rfc3339()],
+        ).unwrap();
+        drop(conn);
+
+        assert_eq!(db.purge_inactive_presence(3600).unwrap(), 1);
+        assert!(db.get_vault_presence("v1").unwrap().iter().all(|p| p.user_id == "fresh"));
+    }
+
+    #[test]
+    fn purge_old_transforms_removes_only_expired_rows() {
+        let db = open_db();
+        let now = chrono::Utc::now();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO operational_transforms (id, vault_id, user_id, operation, position, content, timestamp, version) VALUES ('old', 'v1', 'u', 'insert', 0, 'a', ?1, 1)",
+            params![(now - Duration::days(120)).to_rfc3339()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO operational_transforms (id, vault_id, user_id, operation, position, content, timestamp, version) VALUES ('new', 'v1', 'u', 'insert', 0, 'b', ?1, 2)",
+            params![now.to_rfc3339()],
+        ).unwrap();
+        drop(conn);
+
+        assert_eq!(db.purge_old_transforms(90).unwrap(), 1);
+    }
+
+    #[test]
+    fn offboard_tenant_removes_tenant_and_vault_mappings() {
+        let db = open_db();
+        let now = chrono::Utc::now();
+        db.create_tenant(&crate::models::Tenant {
+            id: "t1".to_string(),
+            name: "Acme".to_string(),
+            owner: "o".to_string(),
+            created_at: now,
+            updated_at: now,
+            is_active: true,
+        }).unwrap();
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO tenant_vaults (tenant_id, vault_id) VALUES ('t1', 'v1')",
+            [],
+        ).unwrap();
+
+        assert_eq!(db.offboard_tenant("t1").unwrap(), 1);
+        assert!(db.get_tenant("t1").unwrap().is_none());
+        assert!(db.get_tenant_vaults("t1").unwrap().is_empty());
+        assert_eq!(db.offboard_tenant("t1").unwrap(), 0);
     }
 }
