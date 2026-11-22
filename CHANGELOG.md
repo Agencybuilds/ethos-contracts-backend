@@ -179,6 +179,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Return 400 (malformed) or 413 (too large) `DecompressionError`s from request body decompression instead of string errors (#930)
+- Return a typed `MetricError` for invalid or conflicting custom metric registrations; kind conflicts now respond 409 (#929)
+- Return a `MetadataLoadError` from lazy vault metadata loads instead of hiding DB errors and corrupt rows (#928)
 - Paginate VaultAuditLog to bound per-operation write cost (#284)
 - Address #596, #597 (#660)
 - Harden ttl_vault: withdrawal/clawback race tests, passkey scope enforcement, deterministic conflict tie-break (#621)
