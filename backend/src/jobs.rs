@@ -232,18 +232,21 @@ pub fn spawn_job(store: JobStore, id: String) {
 /// Submit a new job and return its ID after it has been persisted.
 pub fn enqueue_job(store: &JobStore, job: BulkJob) -> Result<String, SqliteError> {
     let id = job.id.clone();
-    store.lock().unwrap_or_else(|p| p.into_inner()).insert(id.clone(), job);
-    id
+    lock_store(store)?.insert(id.clone(), job);
+    Ok(id)
 }
 
 /// Retrieve a job by ID.
-pub fn get_job(store: &JobStore, id: &str) -> Option<BulkJob> {
-    store.lock().unwrap_or_else(|p| p.into_inner()).get(id).cloned()
+pub fn get_job(store: &JobStore, id: &str) -> Result<Option<BulkJob>, AppError> {
+    Ok(lock_store(store)?.get(id).cloned())
 }
 
 /// List all jobs, optionally filtered by status.
-pub fn list_jobs(store: &JobStore, status_filter: Option<JobStatus>) -> Vec<BulkJob> {
-    let store = store.lock().unwrap_or_else(|p| p.into_inner());
+pub fn list_jobs(
+    store: &JobStore,
+    status_filter: Option<JobStatus>,
+) -> Result<Vec<BulkJob>, AppError> {
+    let store = lock_store(store)?;
     let mut jobs: Vec<BulkJob> = store
         .values()
         .filter(|j| status_filter.as_ref().map_or(true, |s| &j.status == s))
@@ -254,12 +257,12 @@ pub fn list_jobs(store: &JobStore, status_filter: Option<JobStatus>) -> Vec<Bulk
 }
 
 /// Cancel a queued job. Returns false if the job is not found or not cancellable.
-pub fn cancel_job(store: &JobStore, id: &str) -> bool {
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+pub fn cancel_job(store: &JobStore, id: &str) -> Result<bool, AppError> {
+    let mut store = lock_store(store)?;
     if let Some(job) = store.get_mut(id) {
         if matches!(job.status, JobStatus::Queued | JobStatus::Running) {
             job.mark_cancelled();
-            return true;
+            return Ok(true);
         }
     }
     job.mark_running();
@@ -276,14 +279,14 @@ pub fn cancel_job(store: &JobStore, id: &str) -> bool {
 pub fn process_job(store: &JobStore, id: &str) -> Result<(), SqliteError> {
     // Mark running
     {
-        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let mut s = lock_store(store)?;
         if let Some(job) = s.get_mut(id) {
             if job.status != JobStatus::Queued {
-                return; // already picked up or cancelled
+                return Ok(()); // already picked up or cancelled
             }
             job.mark_running();
         } else {
-            return;
+            return Ok(());
         }
     }
 
@@ -316,10 +319,10 @@ pub fn process_job(store: &JobStore, id: &str) -> Result<(), SqliteError> {
         let chunk = batch_size.min(total_items - processed);
         processed += chunk;
 
-        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let mut s = lock_store(store)?;
         if let Some(job) = s.get_mut(id) {
             if job.status == JobStatus::Cancelled {
-                return;
+                return Ok(());
             }
             job.advance(chunk, 0);
         }
@@ -337,7 +340,7 @@ pub fn process_job(store: &JobStore, id: &str) -> Result<(), SqliteError> {
         "message": "Bulk operation completed successfully"
     });
 
-    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut s = lock_store(store)?;
     if let Some(job) = s.get_mut(id) {
         job.mark_completed(result);
         persist_job(&inner, &job)?;
@@ -387,6 +390,11 @@ use axum::{
 
 use crate::error::AppError;
 use crate::error_context::REQUEST_ID_HEADER;
+
+/// Acquire the job store lock, mapping a poisoned mutex to `AppError`.
+fn lock_store(store: &JobStore) -> Result<std::sync::MutexGuard<'_, HashMap<String, BulkJob>>, AppError> {
+    store.lock().map_err(|_| AppError::LockPoisoned)
+}
 
 /// POST /jobs — submit a bulk operation job.
 pub async fn create_job_handler(
@@ -602,7 +610,10 @@ mod tests {
         let done = get_job(&store, &id).unwrap().unwrap();
         assert_eq!(done.status, JobStatus::Completed);
         // The correlation id survives into the job's structured result.
-        assert_eq!(done.result.unwrap()["request_id"], "req-job-77");
+        assert_eq!(
+            done.result.expect("result should be present")["request_id"],
+            "req-job-77"
+        );
     }
 
     #[test]
@@ -619,5 +630,28 @@ mod tests {
         let done = get_job(&store, &id).unwrap().unwrap();
         assert_eq!(done.status, JobStatus::Completed);
         assert_eq!(done.progress, 100);
+    }
+
+    #[test]
+    fn test_poisoned_lock_does_not_panic() {
+        let store = create_job_store();
+        let job = BulkJob::new(BulkOperationType::Custom, serde_json::json!([]), 1, None);
+        let id = enqueue_job(&store, job).expect("enqueue should succeed");
+
+        // Poison the mutex by panicking while holding the lock.
+        let poisoner = Arc::clone(&store);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().expect("lock should succeed");
+            panic!("intentional panic to poison the lock");
+        })
+        .join();
+
+        // All store operations must surface a LockPoisoned error, not panic.
+        assert!(matches!(get_job(&store, &id), Err(AppError::LockPoisoned)));
+        assert!(matches!(list_jobs(&store, None), Err(AppError::LockPoisoned)));
+        assert!(matches!(cancel_job(&store, &id), Err(AppError::LockPoisoned)));
+        assert!(matches!(process_job(&store, &id), Err(AppError::LockPoisoned)));
+        let extra = BulkJob::new(BulkOperationType::Custom, serde_json::json!([]), 1, None);
+        assert!(matches!(enqueue_job(&store, extra), Err(AppError::LockPoisoned)));
     }
 }
