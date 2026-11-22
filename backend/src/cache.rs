@@ -137,7 +137,10 @@ enum MaybeCompressed {
 impl MaybeCompressed {
     /// Encode `value` and decide whether to compress based on the threshold.
     fn encode<T: Serialize>(value: &T, threshold: usize, metrics: &mut CacheMetrics) -> Self {
-        let raw = serde_json::to_vec(value).unwrap_or_default();
+        let raw = serde_json::to_vec(value).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "cache serialization failed; entry will read as a miss");
+            Vec::new()
+        });
         if raw.len() >= threshold {
             let compressed = compress(&raw);
             metrics.compressed_entries += 1;
@@ -156,7 +159,9 @@ impl MaybeCompressed {
                 decompress(b)?
             }
         };
-        serde_json::from_slice(&raw).ok()
+        serde_json::from_slice(&raw)
+            .map_err(|e| tracing::warn!(error = %e, "cache decode failed; treating as miss"))
+            .ok()
     }
 
     /// Whether this entry is stored compressed.
@@ -401,7 +406,7 @@ impl VaultCache {
 
     /// Snapshot of current hit/miss and other metrics.
     pub fn metrics(&self) -> CacheMetrics {
-        self.inner.lock().unwrap().metrics.clone()
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).metrics.clone()
     }
 
     // ── #88 Auto-tune ─────────────────────────────────────────────────────────
@@ -414,7 +419,7 @@ impl VaultCache {
     ///
     /// Returns the new TTL after tuning.
     pub fn auto_tune(&self) -> Duration {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let ratio = inner.metrics.hit_ratio();
         let current_secs = inner.config.ttl.as_secs();
 
@@ -432,7 +437,7 @@ impl VaultCache {
 
     /// Read-only view of the current configuration.
     pub fn config(&self) -> CacheConfig {
-        self.inner.lock().unwrap().config.clone()
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).config.clone()
     }
 
     // ── get_vault / set_vault ─────────────────────────────────────────────────
@@ -442,7 +447,7 @@ impl VaultCache {
     /// Returns `None` if the entry is absent, expired, or bypassed due to
     /// staleness (#90).
     pub fn get_vault(&self, vault_id: &str) -> Option<Vault> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let staleness_ratio = inner.config.staleness_ratio;
         let lookup = inner
             .map
@@ -470,7 +475,7 @@ impl VaultCache {
 
     /// Insert or update the cached `Vault` for `vault_id`.
     pub fn set_vault(&self, vault_id: &str, vault: Vault) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.evict_if_needed();
         let ttl = inner.config.ttl;
         let threshold = inner.config.compression_threshold;
@@ -492,7 +497,7 @@ impl VaultCache {
     /// `Some(None)` = cached "no TTL" result, `Some(Some(n))` = cached value.
     #[allow(clippy::option_option)]
     pub fn get_ttl_remaining(&self, vault_id: &str) -> Option<Option<u64>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let staleness_ratio = inner.config.staleness_ratio;
         let lookup = inner
             .map
@@ -520,7 +525,7 @@ impl VaultCache {
 
     /// Insert or update the cached TTL-remaining value for `vault_id`.
     pub fn set_ttl_remaining(&self, vault_id: &str, ttl_remaining: Option<u64>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.evict_if_needed();
         let ttl = inner.config.ttl;
         let threshold = inner.config.compression_threshold;
@@ -538,7 +543,7 @@ impl VaultCache {
     /// Return the cached `VaultSummary` for `vault_id`, if present and not
     /// expired.
     pub fn get_vault_summary(&self, vault_id: &str) -> Option<VaultSummary> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let staleness_ratio = inner.config.staleness_ratio;
         let lookup = inner
             .map
@@ -566,7 +571,7 @@ impl VaultCache {
 
     /// Insert or update the cached `VaultSummary` for `vault_id`.
     pub fn set_vault_summary(&self, vault_id: &str, summary: VaultSummary) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.evict_if_needed();
         let ttl = inner.config.ttl;
         let threshold = inner.config.compression_threshold;
@@ -583,19 +588,19 @@ impl VaultCache {
 
     /// Remove all cached entries for `vault_id`.
     pub fn invalidate(&self, vault_id: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.map.remove(vault_id);
     }
 
     /// Remove all entries from the cache.
     pub fn invalidate_all(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.map.clear();
     }
 
     /// Return how many vault IDs currently have at least one live entry.
     pub fn live_entry_count(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.map.values().filter(|e| e.has_live_entry()).count()
     }
 
@@ -606,7 +611,7 @@ impl VaultCache {
     /// The token includes the current version number.  Use this when
     /// broadcasting invalidation requests to other cache instances.
     pub fn get_coherence_token(&self, vault_id: &str) -> Option<CoherenceToken> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.map.get(vault_id).and_then(|entries| {
             entries.vault.as_ref().map(|e| CoherenceToken {
                 vault_id: vault_id.to_string(),
@@ -623,7 +628,7 @@ impl VaultCache {
     /// Use this when receiving cross-instance invalidation messages: if the
     /// remote instance has a newer version, discard the local entry.
     pub fn invalidate_if_older(&self, vault_id: &str, remote_version: u64) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entries) = inner.map.get(vault_id) {
             let local_version = entries.vault.as_ref().map(|e| e.version).unwrap_or(0);
             if local_version <= remote_version {
@@ -642,7 +647,7 @@ impl VaultCache {
     ///
     /// Use this for quorum-based consistency verification.
     pub fn verify_quorum(&self, vault_id: &str, remote_tokens: &[CoherenceToken]) -> QuorumResult {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let local_version = inner
             .map
             .get(vault_id)
@@ -670,7 +675,7 @@ impl VaultCache {
     ///
     /// Returns `false` if the entry is absent or already expired.
     pub fn is_stale(&self, vault_id: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let ratio = inner.config.staleness_ratio;
         inner
             .map
@@ -692,7 +697,7 @@ impl VaultCache {
     /// `ratio` must be in `(0.0, 1.0)`.  Values outside this range are
     /// clamped.
     pub fn set_staleness_ratio(&self, ratio: f64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.config.staleness_ratio = ratio.clamp(0.0, 1.0);
     }
 
@@ -701,7 +706,7 @@ impl VaultCache {
     /// Return whether the vault entry for `vault_id` is currently stored
     /// compressed.
     pub fn is_vault_compressed(&self, vault_id: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner
             .map
             .get(vault_id)
@@ -713,7 +718,7 @@ impl VaultCache {
     /// Update the compression threshold at runtime.  Values already stored
     /// are not re-encoded; the new threshold applies to subsequent writes.
     pub fn set_compression_threshold(&self, threshold: usize) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.config.compression_threshold = threshold;
     }
 }
@@ -773,7 +778,7 @@ mod tests {
         cache.set_vault("v1", vault.clone());
         let result = cache.get_vault("v1");
         assert!(result.is_some());
-        assert_eq!(result.unwrap().id, "v1");
+        assert_eq!(result.expect("operation should succeed").id, "v1");
     }
 
     #[test]
@@ -791,7 +796,7 @@ mod tests {
         cache.set_vault("v1", vault.clone());
         vault.balance = 9999;
         cache.set_vault("v1", vault.clone());
-        let result = cache.get_vault("v1").unwrap();
+        let result = cache.get_vault("v1").expect("vault cached");
         assert_eq!(result.balance, 9999);
     }
 
@@ -842,7 +847,7 @@ mod tests {
         cache.set_vault_summary("v1", summary.clone());
         let result = cache.get_vault_summary("v1");
         assert!(result.is_some());
-        assert_eq!(result.unwrap().vault_id, "v1");
+        assert_eq!(result.expect("operation should succeed").vault_id, "v1");
     }
 
     #[test]
@@ -901,9 +906,9 @@ mod tests {
         updated_vault.ttl_remaining = Some(86400 * 2);
         cache.set_vault("v1", updated_vault.clone());
         cache.set_ttl_remaining("v1", Some(86400 * 2));
-        let cached = cache.get_vault("v1").unwrap();
+        let cached = cache.get_vault("v1").expect("vault cached");
         assert_eq!(cached.ttl_remaining, Some(86400 * 2));
-        let cached_ttl = cache.get_ttl_remaining("v1").unwrap();
+        let cached_ttl = cache.get_ttl_remaining("v1").expect("ttl present");
         assert_eq!(cached_ttl, Some(86400 * 2));
     }
 
@@ -1093,16 +1098,16 @@ mod tests {
         cache.set_vault("v1", make_vault("v1"));
         let token = cache.get_coherence_token("v1");
         assert!(token.is_some());
-        assert_eq!(token.unwrap().vault_id, "v1");
+        assert_eq!(token.expect("coherence token present").vault_id, "v1");
     }
 
     #[test]
     fn test_coherence_token_version_increments() {
         let cache = VaultCache::new();
         cache.set_vault("v1", make_vault("v1"));
-        let v1 = cache.get_coherence_token("v1").unwrap().version;
+        let v1 = cache.get_coherence_token("v1").expect("coherence token present").version;
         cache.set_vault("v1", make_vault("v1")); // overwrite → new version
-        let v2 = cache.get_coherence_token("v1").unwrap().version;
+        let v2 = cache.get_coherence_token("v1").expect("coherence token present").version;
         assert!(v2 > v1);
     }
 
@@ -1112,7 +1117,7 @@ mod tests {
     fn test_invalidate_if_older_removes_stale_entry() {
         let cache = VaultCache::new();
         cache.set_vault("v1", make_vault("v1"));
-        let local_version = cache.get_coherence_token("v1").unwrap().version;
+        let local_version = cache.get_coherence_token("v1").expect("coherence token present").version;
         // Remote version is newer → invalidate.
         let evicted = cache.invalidate_if_older("v1", local_version + 1);
         assert!(evicted);
@@ -1123,7 +1128,7 @@ mod tests {
     fn test_invalidate_if_older_keeps_newer_entry() {
         let cache = VaultCache::new();
         cache.set_vault("v1", make_vault("v1"));
-        let local_version = cache.get_coherence_token("v1").unwrap().version;
+        let local_version = cache.get_coherence_token("v1").expect("coherence token present").version;
         // Remote version is older → do NOT invalidate.
         let evicted = cache.invalidate_if_older("v1", local_version - 1);
         assert!(!evicted);
@@ -1136,7 +1141,7 @@ mod tests {
     fn test_quorum_consistent_when_versions_match() {
         let cache = VaultCache::new();
         cache.set_vault("v1", make_vault("v1"));
-        let version = cache.get_coherence_token("v1").unwrap().version;
+        let version = cache.get_coherence_token("v1").expect("coherence token present").version;
         let remote_tokens = vec![
             CoherenceToken {
                 vault_id: "v1".to_string(),
@@ -1157,7 +1162,7 @@ mod tests {
     fn test_quorum_inconsistent_when_versions_differ() {
         let cache = VaultCache::new();
         cache.set_vault("v1", make_vault("v1"));
-        let version = cache.get_coherence_token("v1").unwrap().version;
+        let version = cache.get_coherence_token("v1").expect("coherence token present").version;
         let remote_tokens = vec![CoherenceToken {
             vault_id: "v1".to_string(),
             version: version + 99,
@@ -1245,7 +1250,7 @@ mod tests {
     fn test_compress_decompress_roundtrip() {
         let original = b"hello, cache compression!";
         let compressed = compress(original);
-        let decompressed = decompress(&compressed).unwrap();
+        let decompressed = decompress(&compressed).expect("valid compressed data");
         assert_eq!(decompressed, original);
     }
 
@@ -1253,7 +1258,7 @@ mod tests {
     fn test_compress_decompress_empty() {
         let original: &[u8] = b"";
         let compressed = compress(original);
-        let decompressed = decompress(&compressed).unwrap();
+        let decompressed = decompress(&compressed).expect("valid compressed data");
         assert_eq!(decompressed, original);
     }
 
@@ -1295,7 +1300,7 @@ mod tests {
         });
         let vault = make_vault("v1");
         cache.set_vault("v1", vault.clone());
-        let retrieved = cache.get_vault("v1").unwrap();
+        let retrieved = cache.get_vault("v1").expect("vault cached");
         assert_eq!(retrieved.id, vault.id);
         assert_eq!(retrieved.balance, vault.balance);
     }

@@ -73,7 +73,7 @@ impl FailureTracker {
 
     /// Record a new failure event.
     pub fn record(&self, description: impl Into<String>) {
-        let mut events = self.events.lock().unwrap();
+        let mut events = self.events.lock().unwrap_or_else(|p| p.into_inner());
         if events.len() == self.capacity {
             events.pop_front();
         }
@@ -82,17 +82,17 @@ impl FailureTracker {
 
     /// Return a snapshot of all recorded events.
     pub fn events(&self) -> Vec<CacheFailureEvent> {
-        self.events.lock().unwrap().iter().cloned().collect()
+        self.events.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned().collect()
     }
 
     /// Number of failures currently stored.
     pub fn failure_count(&self) -> usize {
-        self.events.lock().unwrap().len()
+        self.events.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// Remove all recorded events.
     pub fn clear(&self) {
-        self.events.lock().unwrap().clear();
+        self.events.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 }
 
@@ -144,7 +144,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
     /// Simulate a cache backend becoming unavailable.  Sets the internal store
     /// to `None` and marks health as degraded.
     pub fn simulate_backend_failure(&self, reason: impl Into<String>) {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
         *store = None;
         drop(store);
         self.record_failure(reason);
@@ -157,7 +157,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
     /// If the cache backend is unavailable, the failure is recorded and the
     /// write is silently dropped (best-effort).
     pub fn set(&self, key: &str, value: V) {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
         match store.as_mut() {
             Some(map) => {
                 map.insert(key.to_string(), value);
@@ -187,7 +187,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
     {
         // Try cache first.
         {
-            let mut store = self.store.lock().unwrap();
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
             match store.as_mut() {
                 Some(map) => {
                     if let Some(v) = map.get(key) {
@@ -212,7 +212,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
 
         // Write-back if available.
         if let Some(ref v) = value {
-            let mut store = self.store.lock().unwrap();
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(map) = store.as_mut() {
                 map.insert(key.to_string(), v.clone());
             }
@@ -223,7 +223,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
 
     /// Remove a key from the cache.
     pub fn remove(&self, key: &str) {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(map) = store.as_mut() {
             map.remove(key);
         }
@@ -252,7 +252,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
     {
         // Ensure the store is alive before rebuilding.
         {
-            let mut store = self.store.lock().unwrap();
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
             if store.is_none() {
                 *store = Some(std::collections::HashMap::new());
             }
@@ -261,7 +261,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
         let mut loaded = 0;
         for &key in keys {
             if let Some(value) = source_fn(key)? {
-                let mut store = self.store.lock().unwrap();
+                let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(map) = store.as_mut() {
                     map.insert(key.to_string(), value);
                     loaded += 1;
@@ -280,7 +280,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
     pub fn entry_count(&self) -> usize {
         self.store
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .map(|m| m.len())
             .unwrap_or(0)
@@ -360,7 +360,7 @@ mod tests {
         cache.set("k1", "v1".to_string());
         let result: Result<Option<String>, ()> =
             cache.get_or_fallback("k1", |_| Ok(None));
-        assert_eq!(result.unwrap(), Some("v1".to_string()));
+        assert_eq!(result.expect("operation should succeed"), Some("v1".to_string()));
     }
 
     #[test]
@@ -368,7 +368,7 @@ mod tests {
         let cache = make_cache();
         let result: Result<Option<String>, ()> =
             cache.get_or_fallback("missing_key", |k| Ok(Some(format!("source:{k}"))));
-        assert_eq!(result.unwrap(), Some("source:missing_key".to_string()));
+        assert_eq!(result.expect("operation should succeed"), Some("source:missing_key".to_string()));
     }
 
     #[test]
@@ -383,7 +383,7 @@ mod tests {
             source_called = true;
             Ok(None)
         });
-        assert_eq!(result.unwrap(), Some("from_source".to_string()));
+        assert_eq!(result.expect("operation should succeed"), Some("from_source".to_string()));
         assert!(!source_called, "source should not have been called on second get");
     }
 
@@ -393,7 +393,7 @@ mod tests {
         cache.simulate_backend_failure("backend down");
         let result: Result<Option<String>, ()> =
             cache.get_or_fallback("k1", |k| Ok(Some(format!("fallback:{k}"))));
-        assert_eq!(result.unwrap(), Some("fallback:k1".to_string()));
+        assert_eq!(result.expect("operation should succeed"), Some("fallback:k1".to_string()));
     }
 
     #[test]
@@ -418,6 +418,7 @@ mod tests {
                 failure_threshold: 1,
                 success_threshold: 1,
                 open_duration: std::time::Duration::from_millis(1),
+                half_open_max_requests: 1,
             },
         );
 
@@ -435,7 +436,7 @@ mod tests {
             },
         );
 
-        assert_eq!(result.unwrap(), "fallback:cache-hit");
+        assert_eq!(result.expect("operation should succeed"), "fallback:cache-hit");
         assert!(fallback_called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
@@ -461,7 +462,7 @@ mod tests {
         let keys = ["k1", "k2", "k3"];
         let loaded = cache
             .rebuild(&keys, |k| Ok::<Option<String>, ()>(Some(k.to_string())))
-            .unwrap();
+            .expect("operation should succeed");
         assert_eq!(loaded, 3);
         assert_eq!(cache.entry_count(), 3);
     }
@@ -474,7 +475,7 @@ mod tests {
 
         cache
             .rebuild(&["k1"], |_| Ok::<Option<String>, ()>(Some("v".to_string())))
-            .unwrap();
+            .expect("operation should succeed");
         assert_eq!(cache.health(), CacheHealth::Healthy);
     }
 
@@ -483,9 +484,9 @@ mod tests {
         let cache = make_cache();
         cache
             .rebuild(&["k1"], |_| Ok::<Option<String>, ()>(Some("v".to_string())))
-            .unwrap();
+            .expect("operation should succeed");
         let events = cache.tracker.events();
-        assert!(events.last().unwrap().description.contains("rebuilt"));
+        assert!(events.last().expect("at least one recovery event").description.contains("rebuilt"));
     }
 
     #[test]
@@ -500,7 +501,7 @@ mod tests {
                     Ok(None) // k2 not found in source
                 }
             })
-            .unwrap();
+            .expect("operation should succeed");
         assert_eq!(loaded, 1);
     }
 
@@ -513,7 +514,7 @@ mod tests {
         cache.remove("k1");
         let result: Result<Option<String>, ()> =
             cache.get_or_fallback("k1", |_| Ok(None));
-        assert_eq!(result.unwrap(), None);
+        assert_eq!(result.expect("operation should succeed"), None);
     }
 
     // ── entry_count ───────────────────────────────────────────────────────────

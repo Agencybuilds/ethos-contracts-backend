@@ -70,13 +70,12 @@ docker-compose up -d
 ```
 
 This will start:
-- **PostgreSQL** on `localhost:5432`
-- **Backend** on `localhost:3000`
+- **Backend** on `localhost:3000`, with its SQLite database on the `ethos_data` volume (see [ADR-0006](docs/adr/0006-sqlite-backend-storage.md))
 - **Stellar Quickstart** on `localhost:8000`
 
 The `docker-compose.override.yml` configures development-specific settings (standalone Stellar, loose auth, mounted volumes).
 
-Database health check ensures the service is ready before the backend starts.
+The backend stores all data in a single SQLite file set by `DB_PATH` (default `/var/lib/ethos-protocol/ethos-protocol.db`). Set `ALLOW_EPHEMERAL_DB=true` only if you want `DB_PATH=:memory:`, which loses data on restart.
 
 ### Setup Environment
 
@@ -157,6 +156,7 @@ The script will display the target network and identity, then require you to typ
 - [TTL & State Archival Logic](docs/ttl-logic.md)
 - [Vault Hibernation](docs/hibernation.md)
 - [Passkey Integration](docs/passkeys.md)
+- [ZK Proof Verification Guide (Groth16)](docs/zk-proof-verification-guide.md)
 
 ### Beneficiary Features
 - [Beneficiary Conditional Acceptance](docs/beneficiary-conditional-acceptance.md)
@@ -166,7 +166,10 @@ The script will display the target network and identity, then require you to typ
 
 ### Operations
 - [Withdrawal Features](docs/withdrawal-features.md)
+- [Vault Activity History](docs/vault-activity-history.md)
 - [Deployment Guide](docs/deployment-guide.md)
+- [Deployment Runbook](docs/deployment-runbook.md)
+- [Troubleshooting Guide](docs/troubleshooting.md)
 - [Monitoring Guide](docs/monitoring-guide.md)
 - [Disaster Recovery Runbook](docs/disaster-recovery-runbook.md)
 
@@ -177,6 +180,7 @@ The script will display the target network and identity, then require you to typ
 
 ### Reference
 - [API Reference](docs/api-reference.md)
+- [Backend API Documentation with Examples](docs/api-documentation.md)
 - [OpenAPI Specification](docs/openapi.yaml)
 - [Roadmap](docs/roadmap.md)
 
@@ -320,3 +324,9 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-495 -->
 - #495: Add Vault Proof-of-Life Attestation System
+
+<!-- handsoff-issue-596 -->
+- #596: Add Infrastructure as Code (IaC)
+
+<!-- handsoff-issue-783 -->
+- #783: `get_delegation_history` Is Unbounded and Unpaginated

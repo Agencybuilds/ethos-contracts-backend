@@ -232,25 +232,19 @@ pub fn spawn_job(store: JobStore, id: String) {
 /// Submit a new job and return its ID after it has been persisted.
 pub fn enqueue_job(store: &JobStore, job: BulkJob) -> Result<String, SqliteError> {
     let id = job.id.clone();
-    let mut inner = store.0.lock().unwrap();
-    persist_job(&inner, &job)?;
-    inner.jobs.insert(id.clone(), job);
-    Ok(id)
+    store.lock().unwrap_or_else(|p| p.into_inner()).insert(id.clone(), job);
+    id
 }
 
 /// Retrieve a job by ID.
-pub fn get_job(store: &JobStore, id: &str) -> Result<Option<BulkJob>, SqliteError> {
-    Ok(store.0.lock().unwrap().jobs.get(id).cloned())
+pub fn get_job(store: &JobStore, id: &str) -> Option<BulkJob> {
+    store.lock().unwrap_or_else(|p| p.into_inner()).get(id).cloned()
 }
 
 /// List all jobs, optionally filtered by status.
-pub fn list_jobs(
-    store: &JobStore,
-    status_filter: Option<JobStatus>,
-) -> Result<Vec<BulkJob>, SqliteError> {
-    let inner = store.0.lock().unwrap();
-    let mut jobs: Vec<BulkJob> = inner
-        .jobs
+pub fn list_jobs(store: &JobStore, status_filter: Option<JobStatus>) -> Vec<BulkJob> {
+    let store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut jobs: Vec<BulkJob> = store
         .values()
         .filter(|j| status_filter.as_ref().map_or(true, |s| &j.status == s))
         .cloned()
@@ -260,27 +254,13 @@ pub fn list_jobs(
 }
 
 /// Cancel a queued job. Returns false if the job is not found or not cancellable.
-pub fn cancel_job(store: &JobStore, id: &str) -> Result<bool, SqliteError> {
-    let mut inner = store.0.lock().unwrap();
-    let Some(mut job) = inner.jobs.get(id).cloned() else {
-        return Ok(false);
-    };
-    if !matches!(job.status, JobStatus::Queued | JobStatus::Running) {
-        return Ok(false);
-    }
-    job.mark_cancelled();
-    persist_job(&inner, &job)?;
-    inner.jobs.insert(id.to_string(), job);
-    Ok(true)
-}
-
-fn mark_job_running(store: &JobStore, id: &str) -> Result<bool, SqliteError> {
-    let mut inner = store.0.lock().unwrap();
-    let Some(mut job) = inner.jobs.get(id).cloned() else {
-        return Ok(false);
-    };
-    if job.status != JobStatus::Queued {
-        return Ok(false);
+pub fn cancel_job(store: &JobStore, id: &str) -> bool {
+    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(job) = store.get_mut(id) {
+        if matches!(job.status, JobStatus::Queued | JobStatus::Running) {
+            job.mark_cancelled();
+            return true;
+        }
     }
     job.mark_running();
     persist_job(&inner, &job)?;
@@ -295,14 +275,25 @@ fn mark_job_running(store: &JobStore, id: &str) -> Result<bool, SqliteError> {
 
 pub fn process_job(store: &JobStore, id: &str) -> Result<(), SqliteError> {
     // Mark running
-    if !mark_job_running(store, id)? {
-        return Ok(());
+    {
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(job) = s.get_mut(id) {
+            if job.status != JobStatus::Queued {
+                return; // already picked up or cancelled
+            }
+            job.mark_running();
+        } else {
+            return;
+        }
     }
 
     // Simulate processing — real implementations would call domain logic here.
     let (operation, total_items, request_id) = {
-        let inner = store.0.lock().unwrap();
-        let job = inner.jobs.get(id).expect("job was just marked running");
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+        // A job removed while it was queued is not an error to panic on (#893).
+        let Some(job) = s.get(id) else {
+            return;
+        };
         (
             job.operation.clone(),
             job.total_items,
@@ -325,12 +316,12 @@ pub fn process_job(store: &JobStore, id: &str) -> Result<(), SqliteError> {
         let chunk = batch_size.min(total_items - processed);
         processed += chunk;
 
-        let mut inner = store.0.lock().unwrap();
-        let Some(mut job) = inner.jobs.get(id).cloned() else {
-            return Ok(());
-        };
-        if job.status == JobStatus::Cancelled {
-            return Ok(());
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(job) = s.get_mut(id) {
+            if job.status == JobStatus::Cancelled {
+                return;
+            }
+            job.advance(chunk, 0);
         }
         job.advance(chunk, 0);
         persist_job(&inner, &job)?;
@@ -346,11 +337,8 @@ pub fn process_job(store: &JobStore, id: &str) -> Result<(), SqliteError> {
         "message": "Bulk operation completed successfully"
     });
 
-    let mut inner = store.0.lock().unwrap();
-    if let Some(mut job) = inner.jobs.get(id).cloned() {
-        if job.status == JobStatus::Cancelled {
-            return Ok(());
-        }
+    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(job) = s.get_mut(id) {
         job.mark_completed(result);
         persist_job(&inner, &job)?;
         inner.jobs.insert(id.to_string(), job);
@@ -361,6 +349,7 @@ pub fn process_job(store: &JobStore, id: &str) -> Result<(), SqliteError> {
 // ── HTTP request / response types ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateJobRequest {
     pub operation: BulkOperationType,
     /// The items to process. For `update_ttl`, list of vault IDs; for
@@ -383,6 +372,7 @@ pub struct JobStatusResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListJobsQuery {
     pub status: Option<JobStatus>,
 }

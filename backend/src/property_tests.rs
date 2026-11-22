@@ -332,11 +332,11 @@ mod tests {
             // Insert some vaults directly.
             for i in 0..n_active {
                 let v = make_vault(&format!("va{i}"), "owner", 100, VaultStatus::Active);
-                db.insert_vault(v);
+                db.insert_vault(v).unwrap();
             }
             for i in 0..n_released {
                 let v = make_vault(&format!("vr{i}"), "owner", 100, VaultStatus::Released);
-                db.insert_vault(v);
+                db.insert_vault(v).unwrap();
             }
 
             // Full refresh.
@@ -388,7 +388,10 @@ mod tests {
             };
 
             loader.set(m.clone()).unwrap();
-            let loaded = loader.get(&vault_id).unwrap();
+            let loaded = loader
+                .get(&vault_id)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?
+                .ok_or_else(|| TestCaseError::fail("metadata should exist after set"))?;
 
             prop_assert_eq!(
                 loaded.fields["note"].as_str().unwrap_or(""),
@@ -421,7 +424,10 @@ mod tests {
             loader.delete(&vault_id).unwrap();
 
             prop_assert!(
-                loader.get(&vault_id).is_none(),
+                loader
+                    .get(&vault_id)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?
+                    .is_none(),
                 "deleted metadata should not be retrievable"
             );
         }
@@ -440,7 +446,7 @@ mod tests {
             let vault_store = create_vault_store();
             for i in 0..n_vaults {
                 let v = make_vault(&format!("v{i}"), "owner", 100, VaultStatus::Active);
-                vault_store.lock().unwrap().insert(v.id.clone(), v);
+                vault_store.lock().unwrap_or_else(|p| p.into_inner()).insert(v.id.clone(), v);
             }
 
             // Collect all pages.
@@ -550,7 +556,10 @@ mod tests {
     fn regression_lazy_loader_empty_vault_id() {
         let db = open_db();
         let loader = LazyMetadataLoader::new(db);
-        assert!(loader.get("").is_none(), "empty vault_id should return None");
+        assert!(
+            matches!(loader.get(""), Ok(None)),
+            "empty vault_id should return Ok(None)"
+        );
     }
 
     /// Edge case: materialized view with zero vaults should return all zeros.

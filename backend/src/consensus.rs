@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+/// Key used by [`NodeCache::probe`]. Never written by application code.
+const READINESS_PROBE_KEY: &str = "__readiness_probe__";
+
 /// A versioned cache entry shared across backend nodes.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -18,6 +21,37 @@ pub struct CacheEntry {
 pub enum ConflictStrategy {
     LastWriteWins,
     Voting,
+}
+
+impl ConflictStrategy {
+    /// Every accepted `CONSENSUS_STRATEGY` value, for error messages and docs.
+    pub const ACCEPTED: &'static [&'static str] = &["last_write_wins", "voting"];
+
+    /// The canonical name, as accepted by [`parse_conflict_strategy`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConflictStrategy::LastWriteWins => "last_write_wins",
+            ConflictStrategy::Voting => "voting",
+        }
+    }
+}
+
+/// Parse a `CONSENSUS_STRATEGY` value (#699).
+///
+/// An unset or empty value selects the default, `last_write_wins`. Any other
+/// value must match an accepted name (case-insensitive, surrounding whitespace
+/// ignored). Unknown values are an error rather than a silent fallback, so a
+/// typo such as `votng` cannot change the conflict policy unnoticed.
+pub fn parse_conflict_strategy(raw: Option<&str>) -> Result<ConflictStrategy, String> {
+    let value = raw.unwrap_or("").trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "last_write_wins" => Ok(ConflictStrategy::LastWriteWins),
+        "voting" => Ok(ConflictStrategy::Voting),
+        other => Err(format!(
+            "unknown CONSENSUS_STRATEGY {other:?}; expected one of: {}",
+            ConflictStrategy::ACCEPTED.join(", ")
+        )),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -58,19 +92,19 @@ impl InMemoryBackend {
 
 impl CacheBackend for InMemoryBackend {
     fn get_entry(&self, key: &str) -> Result<Option<CacheEntry>, String> {
-        Ok(self.entries.lock().unwrap().get(key).cloned())
+        Ok(self.entries.lock().unwrap_or_else(|p| p.into_inner()).get(key).cloned())
     }
 
     fn set_entry(&self, entry: &CacheEntry) -> Result<(), String> {
         self.entries
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(entry.key.clone(), entry.clone());
         Ok(())
     }
 
     fn all_entries(&self) -> Result<Vec<CacheEntry>, String> {
-        Ok(self.entries.lock().unwrap().values().cloned().collect())
+        Ok(self.entries.lock().unwrap_or_else(|p| p.into_inner()).values().cloned().collect())
     }
 }
 
@@ -166,27 +200,23 @@ impl NodeCache {
         self.strategy
     }
 
-    pub fn from_env() -> Arc<Self> {
+    /// Build from environment variables. Fails on an unrecognised
+    /// `CONSENSUS_STRATEGY` instead of falling back to a default (#699).
+    pub fn from_env() -> Result<Arc<Self>, String> {
         let node_id = std::env::var("NODE_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
-        let strategy = match std::env::var("CONSENSUS_STRATEGY")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "voting" => ConflictStrategy::Voting,
-            _ => ConflictStrategy::LastWriteWins,
-        };
+        let strategy =
+            parse_conflict_strategy(std::env::var("CONSENSUS_STRATEGY").ok().as_deref())?;
 
         let backend: Arc<dyn CacheBackend> = if let Ok(redis_url) = std::env::var("REDIS_URL") {
             Arc::new(
                 RedisBackend::new(&redis_url)
-                    .unwrap_or_else(|e| panic!("failed to connect to Redis: {e}")),
+                    .map_err(|e| format!("failed to connect to Redis: {e}"))?,
             )
         } else {
             Arc::new(InMemoryBackend::new())
         };
 
-        Arc::new(Self::new(node_id, backend, strategy))
+        Ok(Arc::new(Self::new(node_id, backend, strategy)))
     }
 
     pub fn put(&self, key: &str, value: &str) -> Result<CacheEntry, String> {
@@ -194,7 +224,7 @@ impl NodeCache {
         self.backend.set_entry(&entry)?;
         self.local
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(key.to_string(), entry.clone());
         Ok(entry)
     }
@@ -203,9 +233,15 @@ impl NodeCache {
         self.backend.get_entry(key)
     }
 
+    /// Verify the backing store is reachable (#698). Reads a key that is never
+    /// written, so the probe exercises the backend without mutating state.
+    pub fn probe(&self) -> Result<(), String> {
+        self.backend.get_entry(READINESS_PROBE_KEY).map(|_| ())
+    }
+
     pub fn sync_local_from_remote(&self) -> Result<(), String> {
         let entries = self.backend.all_entries()?;
-        let mut local = self.local.lock().unwrap();
+        let mut local = self.local.lock().unwrap_or_else(|p| p.into_inner());
         local.clear();
         for entry in entries {
             local.insert(entry.key.clone(), entry);
@@ -222,7 +258,7 @@ impl NodeCache {
             .map(|entry| (entry.key.clone(), entry))
             .collect();
 
-        let local_snapshot = self.local.lock().unwrap().clone();
+        let local_snapshot = self.local.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let all_keys: HashSet<String> = local_snapshot
             .keys()
             .chain(remote_entries.keys())
@@ -250,7 +286,7 @@ impl NodeCache {
 
             if let Some(resolved) = winner {
                 self.backend.set_entry(&resolved)?;
-                self.local.lock().unwrap().insert(key.clone(), resolved);
+                self.local.lock().unwrap_or_else(|p| p.into_inner()).insert(key.clone(), resolved);
                 conflicts_resolved += 1;
             }
         }
@@ -279,7 +315,7 @@ impl NodeCache {
 
     /// Test helper: directly seed a local cache entry, bypassing the backend.
     pub fn set_local_entry(&self, entry: CacheEntry) {
-        self.local.lock().unwrap().insert(entry.key.clone(), entry);
+        self.local.lock().unwrap_or_else(|p| p.into_inner()).insert(entry.key.clone(), entry);
     }
 }
 
@@ -337,7 +373,7 @@ mod tests {
             key: key.to_string(),
             value: value.to_string(),
             node_id: node.to_string(),
-            updated_at: Utc.timestamp_millis_opt(millis).unwrap(),
+            updated_at: Utc.timestamp_millis_opt(millis).single().expect("valid timestamp"),
             version: millis as u64,
         }
     }
@@ -351,7 +387,7 @@ mod tests {
         let older = sample_entry("k", "old", "node-a", 1_000);
         let newer = sample_entry("k", "new", "node-b", 2_000);
         let winner =
-            resolve_conflict(Some(&older), Some(&newer), ConflictStrategy::LastWriteWins).unwrap();
+            resolve_conflict(Some(&older), Some(&newer), ConflictStrategy::LastWriteWins).expect("a winner");
         assert_eq!(winner.value, "new");
     }
 
@@ -359,7 +395,7 @@ mod tests {
     fn voting_prefers_higher_version() {
         let low = sample_entry("k", "low", "node-a", 1_000);
         let high = sample_entry("k", "high", "node-b", 2_000);
-        let winner = resolve_conflict(Some(&low), Some(&high), ConflictStrategy::Voting).unwrap();
+        let winner = resolve_conflict(Some(&low), Some(&high), ConflictStrategy::Voting).expect("a winner");
         assert_eq!(winner.value, "high");
     }
 
@@ -377,16 +413,16 @@ mod tests {
             ConflictStrategy::LastWriteWins,
         );
 
-        node_a.put("vault:1", "prefs-a").unwrap();
-        let remote = node_b.get("vault:1").unwrap().expect("remote entry");
+        node_a.put("vault:1", "prefs-a").expect("put should succeed");
+        let remote = node_b.get("vault:1").expect("backend read").expect("remote entry");
         let stale = sample_entry("vault:1", "stale-local", "node-b", 1);
         node_b.set_local_entry(stale);
 
-        let report = node_b.check_and_resolve().unwrap();
+        let report = node_b.check_and_resolve().expect("resolve should succeed");
         assert!(!report.consistent);
         assert_eq!(report.conflicts_resolved, 1);
 
-        let resolved = node_b.get("vault:1").unwrap().expect("resolved entry");
+        let resolved = node_b.get("vault:1").expect("backend read").expect("resolved entry");
         assert_eq!(resolved.value, remote.value);
     }
 
@@ -404,12 +440,12 @@ mod tests {
             ConflictStrategy::LastWriteWins,
         );
 
-        node_a.put("vault:2", "shared").unwrap();
-        node_b.sync_local_from_remote().unwrap();
+        node_a.put("vault:2", "shared").expect("put should succeed");
+        node_b.sync_local_from_remote().expect("sync should succeed");
 
-        let report = node_b.check_and_resolve().unwrap();
+        let report = node_b.check_and_resolve().expect("resolve should succeed");
         assert!(report.consistent);
-        assert_eq!(node_b.get("vault:2").unwrap().unwrap().value, "shared");
+        assert_eq!(node_b.get("vault:2").expect("backend read").expect("entry present").value, "shared");
     }
 
     #[test]
@@ -419,12 +455,78 @@ mod tests {
         let node_b = NodeCache::new("node-b", Arc::clone(&backend), ConflictStrategy::Voting);
 
         let newer = sample_entry("vault:3", "winner", "node-a", 5_000);
-        backend.set_entry(&newer).unwrap();
+        backend.set_entry(&newer).expect("set should succeed");
         node_a.set_local_entry(newer.clone());
         node_b.set_local_entry(sample_entry("vault:3", "loser", "node-b", 2_000));
 
-        let report = node_b.check_and_resolve().unwrap();
+        let report = node_b.check_and_resolve().expect("resolve should succeed");
         assert_eq!(report.conflicts_resolved, 1);
-        assert_eq!(node_b.get("vault:3").unwrap().unwrap().value, "winner");
+        assert_eq!(node_b.get("vault:3").expect("backend read").expect("entry present").value, "winner");
+    }
+
+    #[test]
+    fn strategy_unset_or_empty_defaults_to_last_write_wins() {
+        assert_eq!(
+            parse_conflict_strategy(None),
+            Ok(ConflictStrategy::LastWriteWins)
+        );
+        assert_eq!(
+            parse_conflict_strategy(Some("")),
+            Ok(ConflictStrategy::LastWriteWins)
+        );
+        assert_eq!(
+            parse_conflict_strategy(Some("   ")),
+            Ok(ConflictStrategy::LastWriteWins)
+        );
+    }
+
+    #[test]
+    fn strategy_accepts_each_documented_value() {
+        assert_eq!(
+            parse_conflict_strategy(Some("last_write_wins")),
+            Ok(ConflictStrategy::LastWriteWins)
+        );
+        assert_eq!(
+            parse_conflict_strategy(Some("voting")),
+            Ok(ConflictStrategy::Voting)
+        );
+    }
+
+    #[test]
+    fn strategy_is_case_and_whitespace_insensitive() {
+        assert_eq!(
+            parse_conflict_strategy(Some("  VOTING ")),
+            Ok(ConflictStrategy::Voting)
+        );
+        assert_eq!(
+            parse_conflict_strategy(Some("Last_Write_Wins")),
+            Ok(ConflictStrategy::LastWriteWins)
+        );
+    }
+
+    #[test]
+    fn strategy_rejects_unknown_values() {
+        // A typo must fail loudly instead of falling back to last-write-wins.
+        let err = parse_conflict_strategy(Some("votng")).unwrap_err();
+        assert!(
+            err.contains("\"votng\""),
+            "error names the bad value: {err}"
+        );
+        assert!(
+            err.contains("last_write_wins, voting"),
+            "error lists options: {err}"
+        );
+        assert!(parse_conflict_strategy(Some("last-write-wins")).is_err());
+        assert!(parse_conflict_strategy(Some("lww")).is_err());
+    }
+
+    #[test]
+    fn strategy_as_str_round_trips_through_parser() {
+        for strategy in [ConflictStrategy::LastWriteWins, ConflictStrategy::Voting] {
+            assert_eq!(
+                parse_conflict_strategy(Some(strategy.as_str())),
+                Ok(strategy)
+            );
+        }
     }
 }

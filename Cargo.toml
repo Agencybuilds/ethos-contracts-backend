@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["contracts/ttl_vault", "contracts/zk_verifier", "contracts/sbt", "backend"]
+members = [
+    "contracts/ttl_vault",
+    "contracts/zk_verifier",
+    "contracts/sbt",
+    "backend",
+    "contracts/insurance_pool",
+    "crates/metric-retention",
+    "crates/synthetic-monitor",
+    "crates/vault-yield",
+]
 
 [workspace.package]
 license = "MIT"
@@ -21,15 +30,15 @@ too_many_lines = "allow"
 unused_self = "allow"
 
 # Integer conversions common in on-chain ledger/time math
-cast_possible_truncation = "allow"
-cast_sign_loss = "allow"
-cast_precision_loss = "allow"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_precision_loss = "warn"
 cast_lossless = "allow"
 unnecessary_cast = "allow"
 
 # Documentation style; enforced selectively as the codebase matures
 missing_errors_doc = "allow"
-missing_panics_doc = "allow"
+missing_panics_doc = "warn"
 doc_markdown = "allow"
 
 # Large domain models and error enums
@@ -44,7 +53,7 @@ items_after_statements = "allow"
 match_wildcard_for_single_variants = "allow"
 single_match_else = "allow"
 implicit_hasher = "allow"
-indexing_slicing = "allow"
+indexing_slicing = "warn"
 
 # Test helpers
 should_panic_without_expect = "allow"

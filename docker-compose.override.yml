@@ -1,12 +1,6 @@
 version: '3.9'
 
 services:
-  db:
-    environment:
-      POSTGRES_HOST_AUTH_METHOD: trust
-    volumes:
-      - ./backend/migrations:/docker-entrypoint-initdb.d
-
   backend:
     build:
       context: .
@@ -17,6 +11,9 @@ services:
       RUST_BACKTRACE: "1"
     ports:
       - "3000:3000"
+    # Local development only: cargo-watch reloads on host edits (#693).
+    volumes:
+      - ./backend/src:/app/src
 
   stellar-quickstart:
     environment:

@@ -158,7 +158,7 @@ impl DeadlockDetector {
     /// - If `holder` already holds `resource`, `Ok(())` is returned
     ///   (re-entrant acquisition).
     pub fn acquire_lock(&self, resource: &str, holder: &str) -> Result<(), DeadlockError> {
-        let mut locks = self.active_locks.lock().unwrap();
+        let mut locks = self.active_locks.lock().unwrap_or_else(|p| p.into_inner());
 
         // Re-entrant: same holder already owns the lock.
         if locks.get(resource).is_some_and(|e| e.holder == holder) {
@@ -196,7 +196,7 @@ impl DeadlockDetector {
     ///
     /// If `holder` is not the current holder the call is silently ignored.
     pub fn release_lock(&self, resource: &str, holder: &str) {
-        let mut locks = self.active_locks.lock().unwrap();
+        let mut locks = self.active_locks.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = locks.get(resource) {
             if entry.holder == holder {
                 locks.remove(resource);
@@ -211,7 +211,7 @@ impl DeadlockDetector {
     /// holds some other resource that the current holder of `resource` is
     /// waiting on (directly or transitively), a cycle exists.
     pub fn detect_cycle(&self, resource: &str, holder: &str) -> bool {
-        let locks = self.active_locks.lock().unwrap();
+        let locks = self.active_locks.lock().unwrap_or_else(|p| p.into_inner());
         Self::check_cycle_inner(&locks, resource, holder)
     }
 
@@ -309,7 +309,7 @@ impl DeadlockDetector {
 
     /// Return a point-in-time snapshot of detector statistics.
     pub fn stats(&self) -> DeadlockStats {
-        let locks = self.active_locks.lock().unwrap();
+        let locks = self.active_locks.lock().unwrap_or_else(|p| p.into_inner());
         DeadlockStats {
             deadlocks_detected: self.deadlock_count.load(Ordering::Relaxed),
             retries_performed: self.retry_count.load(Ordering::Relaxed),
@@ -342,15 +342,19 @@ mod tests {
     #[test]
     fn test_second_holder_gets_timeout() {
         let d = DeadlockDetector::new();
-        d.acquire_lock("vaults", "req1").unwrap();
-        let err = d.acquire_lock("vaults", "req2").unwrap_err();
+        d.acquire_lock("vaults", "req1")
+            .expect("first acquisition should succeed");
+        let err = d
+            .acquire_lock("vaults", "req2")
+            .expect_err("second holder should not acquire the lock");
         assert!(matches!(err, DeadlockError::Timeout { .. }));
     }
 
     #[test]
     fn test_reentrant_acquire_is_ok() {
         let d = DeadlockDetector::new();
-        d.acquire_lock("vaults", "req1").unwrap();
+        d.acquire_lock("vaults", "req1")
+            .expect("first acquisition should succeed");
         assert!(d.acquire_lock("vaults", "req1").is_ok());
     }
 
@@ -358,7 +362,7 @@ mod tests {
     fn test_with_retry_succeeds_on_first_try() {
         let cfg = RetryConfig::default();
         let result = DeadlockDetector::with_retry(&cfg, || Ok::<i32, DeadlockError>(42));
-        assert_eq!(result.unwrap(), 42);
+        assert_eq!(result.expect("retry should succeed on first try"), 42);
     }
 
     #[test]
@@ -379,7 +383,7 @@ mod tests {
     #[test]
     fn test_enforce_query_timeout_ok() {
         let result = DeadlockDetector::enforce_query_timeout(1_000, || 99_u32);
-        assert_eq!(result.unwrap(), 99);
+        assert_eq!(result.expect("query should complete within timeout"), 99);
     }
 
     #[test]

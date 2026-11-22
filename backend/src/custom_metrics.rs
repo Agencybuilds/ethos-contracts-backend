@@ -3,19 +3,22 @@
 //! insights.").
 //!
 //! `metrics.rs` exposes a fixed set of Prometheus counters/gauges. This
-//! module lets callers record arbitrary named, tagged metric points at
-//! runtime, aggregate them (sum/avg/min/max/count), and ships ready-made
-//! Grafana dashboard templates plus a lightweight sharing mechanism so a
-//! generated dashboard link can be handed to a teammate.
+//! module lets callers define custom metrics (`counter` or `gauge`), record
+//! arbitrary named, tagged metric points at runtime, aggregate them
+//! (sum/avg/min/max/count), export everything in the Prometheus text format
+//! (`GET /metrics/custom/export`) so it can be scraped into existing
+//! dashboards, and ships ready-made Grafana dashboard templates plus a
+//! lightweight sharing mechanism so a generated dashboard link can be handed
+//! to a teammate.
 //!
 //! See `docs/custom-dashboards.md` for end-to-end usage.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -33,6 +36,7 @@ pub struct MetricPoint {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordMetricRequest {
     pub name: String,
     pub value: f64,
@@ -70,6 +74,7 @@ impl Aggregation {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AggregateQuery {
     #[serde(default = "default_aggregation")]
     pub agg: Aggregation,
@@ -87,6 +92,136 @@ pub struct AggregateResponse {
     pub sample_count: usize,
 }
 
+/// How a defined metric's points are exported to Prometheus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricKind {
+    /// Monotonic total. Exported as the sum of recorded values per label set.
+    Counter,
+    /// Point-in-time value. Exported as the most recent value per label set.
+    Gauge,
+}
+
+impl MetricKind {
+    fn prometheus_type(self) -> &'static str {
+        match self {
+            MetricKind::Counter => "counter",
+            MetricKind::Gauge => "gauge",
+        }
+    }
+}
+
+/// Declared metric: its name, kind, and human-readable metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricDefinition {
+    pub name: String,
+    pub kind: MetricKind,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub unit: Option<String>,
+}
+
+/// Why a metric definition or data point was rejected.
+///
+/// Registration and recording return this instead of panicking, so a
+/// duplicate or malformed metric name surfaces as an error the caller can
+/// handle (or report as an HTTP status) rather than crashing at startup.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MetricError {
+    /// The name does not match the Prometheus metric name grammar.
+    #[error("invalid metric name '{0}'")]
+    InvalidName(String),
+    /// The value is NaN or infinite, which Prometheus cannot represent.
+    #[error("value for '{name}' must be finite")]
+    NonFiniteValue { name: String },
+    /// A tag key is not a valid Prometheus label name.
+    #[error("invalid label name '{label}' on '{name}'")]
+    InvalidLabel { name: String, label: String },
+    /// The metric is already registered with a different kind.
+    #[error("metric '{name}' is already defined as a {}", .existing.prometheus_type())]
+    KindConflict { name: String, existing: MetricKind },
+}
+
+impl MetricError {
+    /// HTTP status for this error: **409 Conflict** when a metric name is
+    /// already registered as another kind, **400 Bad Request** otherwise.
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            Self::KindConflict { .. } => StatusCode::CONFLICT,
+            Self::InvalidName(_) | Self::NonFiniteValue { .. } | Self::InvalidLabel { .. } => {
+                StatusCode::BAD_REQUEST
+            }
+        }
+    }
+}
+
+impl IntoResponse for MetricError {
+    fn into_response(self) -> axum::response::Response {
+        (self.status_code(), self.to_string()).into_response()
+    }
+}
+
+/// Prometheus metric name: `[a-zA-Z_:][a-zA-Z0-9_:]*`.
+pub fn is_valid_metric_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == ':')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
+/// Prometheus label name: `[a-zA-Z_][a-zA-Z0-9_]*`, without the reserved `__` prefix.
+pub fn is_valid_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.starts_with("__")
+}
+
+/// Check a point before it is stored. Rejects invalid names, non-finite
+/// values (which Prometheus cannot represent), and invalid label keys.
+pub fn validate_point(
+    name: &str,
+    value: f64,
+    tags: &HashMap<String, String>,
+) -> Result<(), MetricError> {
+    if !is_valid_metric_name(name) {
+        return Err(MetricError::InvalidName(name.to_string()));
+    }
+    if !value.is_finite() {
+        return Err(MetricError::NonFiniteValue {
+            name: name.to_string(),
+        });
+    }
+    if let Some(bad) = tags.keys().find(|k| !is_valid_label_name(k)) {
+        return Err(MetricError::InvalidLabel {
+            name: name.to_string(),
+            label: bad.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Escape a label value or help text for the Prometheus text format.
+fn escape_prometheus(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
+}
+
+fn format_labels(tags: &HashMap<String, String>) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    let sorted: BTreeMap<&String, &String> = tags.iter().collect();
+    let body = sorted
+        .iter()
+        .map(|(k, v)| format!("{k}=\"{}\"", escape_prometheus(v)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
+}
+
 /// A saved dashboard share: a stable token pointing at a named dashboard so
 /// the underlying template/metric selection can change without breaking
 /// links already handed out.
@@ -99,6 +234,7 @@ pub struct DashboardShare {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateShareRequest {
     pub dashboard: String,
     #[serde(default)]
@@ -108,6 +244,7 @@ pub struct CreateShareRequest {
 #[derive(Default)]
 struct Inner {
     series: HashMap<String, Vec<MetricPoint>>,
+    definitions: HashMap<String, MetricDefinition>,
     shares: HashMap<String, DashboardShare>,
 }
 
@@ -123,16 +260,99 @@ impl CustomMetricsStore {
     }
 
     pub fn record(&self, name: &str, value: f64, tags: HashMap<String, String>) {
-        let mut inner = self.inner.write().expect("metrics lock poisoned");
-        inner.series.entry(name.to_string()).or_default().push(MetricPoint {
-            timestamp: Utc::now(),
-            value,
-            tags,
-        });
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner
+            .series
+            .entry(name.to_string())
+            .or_default()
+            .push(MetricPoint {
+                timestamp: Utc::now(),
+                value,
+                tags,
+            });
+    }
+
+    /// Declare a metric. Redefining an existing metric updates its metadata,
+    /// but its kind is fixed once declared, since changing it would make the
+    /// exported time series ambiguous.
+    pub fn define_metric(&self, def: MetricDefinition) -> Result<MetricDefinition, MetricError> {
+        if !is_valid_metric_name(&def.name) {
+            return Err(MetricError::InvalidName(def.name));
+        }
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = inner.definitions.get(&def.name) {
+            if existing.kind != def.kind {
+                return Err(MetricError::KindConflict {
+                    name: def.name,
+                    existing: existing.kind,
+                });
+            }
+        }
+        inner.definitions.insert(def.name.clone(), def.clone());
+        Ok(def)
+    }
+
+    /// Declared metrics, sorted by name.
+    pub fn definitions(&self) -> Vec<MetricDefinition> {
+        let mut defs: Vec<MetricDefinition> = self
+            .inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .definitions
+            .values()
+            .cloned()
+            .collect();
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
+        defs
+    }
+
+    /// Render every metric in the Prometheus text exposition format.
+    ///
+    /// Each distinct label set becomes one sample. Counters export the sum of
+    /// their values; gauges export the value of the newest point. Metrics that
+    /// were recorded without a definition are exported as `untyped`.
+    pub fn export_prometheus(&self) -> String {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let names: BTreeSet<&String> = inner
+            .series
+            .keys()
+            .chain(inner.definitions.keys())
+            .collect();
+
+        let mut out = String::new();
+        for name in names {
+            let def = inner.definitions.get(name);
+            if let Some(help) = def.and_then(|d| d.description.as_ref()) {
+                let help = help.replace('\\', "\\\\").replace('\n', "\\n");
+                out.push_str(&format!("# HELP {name} {help}\n"));
+            }
+            let kind = def.map_or("untyped", |d| d.kind.prometheus_type());
+            out.push_str(&format!("# TYPE {name} {kind}\n"));
+
+            let points: &[MetricPoint] = inner.series.get(name).map_or(&[], Vec::as_slice);
+            let mut by_labels: BTreeMap<String, Vec<&MetricPoint>> = BTreeMap::new();
+            for point in points {
+                by_labels
+                    .entry(format_labels(&point.tags))
+                    .or_default()
+                    .push(point);
+            }
+            for (labels, group) in by_labels {
+                let value = match def.map(|d| d.kind) {
+                    Some(MetricKind::Counter) => group.iter().map(|p| p.value).sum(),
+                    _ => group
+                        .iter()
+                        .max_by_key(|p| p.timestamp)
+                        .map_or(0.0, |p| p.value),
+                };
+                out.push_str(&format!("{name}{labels} {value}\n"));
+            }
+        }
+        out
     }
 
     pub fn aggregate(&self, name: &str, agg: Aggregation) -> Option<AggregateResponse> {
-        let inner = self.inner.read().expect("metrics lock poisoned");
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let points = inner.series.get(name)?;
         Some(AggregateResponse {
             name: name.to_string(),
@@ -145,7 +365,7 @@ impl CustomMetricsStore {
     pub fn list_metric_names(&self) -> Vec<String> {
         self.inner
             .read()
-            .expect("metrics lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .series
             .keys()
             .cloned()
@@ -161,7 +381,7 @@ impl CustomMetricsStore {
         };
         self.inner
             .write()
-            .expect("metrics lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .shares
             .insert(share.token.clone(), share.clone());
         share
@@ -170,7 +390,7 @@ impl CustomMetricsStore {
     pub fn resolve_share(&self, token: &str) -> Option<DashboardShare> {
         self.inner
             .read()
-            .expect("metrics lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .shares
             .get(token)
             .cloned()
@@ -234,8 +454,11 @@ pub async fn record_custom_metric(
     State(store): State<Arc<CustomMetricsStore>>,
     Json(req): Json<RecordMetricRequest>,
 ) -> impl IntoResponse {
+    if let Err(err) = validate_point(&req.name, req.value, &req.tags) {
+        return err.into_response();
+    }
     store.record(&req.name, req.value, req.tags);
-    StatusCode::ACCEPTED
+    StatusCode::ACCEPTED.into_response()
 }
 
 /// `GET /metrics/custom` - list known custom metric names.
@@ -243,6 +466,40 @@ pub async fn list_custom_metrics(
     State(store): State<Arc<CustomMetricsStore>>,
 ) -> impl IntoResponse {
     Json(store.list_metric_names())
+}
+
+/// `POST /metrics/custom/definitions` - declare a counter or gauge.
+///
+/// Returns 400 for an invalid name and 409 when the name is already
+/// registered with a different kind.
+pub async fn define_custom_metric(
+    State(store): State<Arc<CustomMetricsStore>>,
+    Json(def): Json<MetricDefinition>,
+) -> impl IntoResponse {
+    match store.define_metric(def) {
+        Ok(saved) => (StatusCode::CREATED, Json(saved)).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// `GET /metrics/custom/definitions` - list declared metrics.
+pub async fn list_custom_metric_definitions(
+    State(store): State<Arc<CustomMetricsStore>>,
+) -> impl IntoResponse {
+    Json(store.definitions())
+}
+
+/// `GET /metrics/custom/export` - all custom metrics in Prometheus text format.
+pub async fn export_custom_metrics(
+    State(store): State<Arc<CustomMetricsStore>>,
+) -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        store.export_prometheus(),
+    )
 }
 
 /// `GET /metrics/custom/:name/aggregate?agg=avg|sum|min|max|count`.
@@ -285,42 +542,40 @@ pub async fn get_shared_dashboard(
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn aggregate(
+        store: &CustomMetricsStore,
+        name: &str,
+        agg: Aggregation,
+    ) -> Result<AggregateResponse, String> {
+        store
+            .aggregate(name, agg)
+            .ok_or_else(|| format!("no series recorded for '{name}'"))
+    }
+
     #[test]
-    fn aggregates_sum_avg_min_max_count() {
+    fn aggregates_sum_avg_min_max_count() -> TestResult {
         let store = CustomMetricsStore::default();
         for v in [1.0, 2.0, 3.0, 4.0] {
             store.record("checkout_latency_ms", v, HashMap::new());
         }
 
-        assert_eq!(
-            store.aggregate("checkout_latency_ms", Aggregation::Sum).unwrap().value,
-            10.0
-        );
-        assert_eq!(
-            store.aggregate("checkout_latency_ms", Aggregation::Avg).unwrap().value,
-            2.5
-        );
-        assert_eq!(
-            store.aggregate("checkout_latency_ms", Aggregation::Min).unwrap().value,
-            1.0
-        );
-        assert_eq!(
-            store.aggregate("checkout_latency_ms", Aggregation::Max).unwrap().value,
-            4.0
-        );
-        assert_eq!(
-            store
-                .aggregate("checkout_latency_ms", Aggregation::Count)
-                .unwrap()
-                .sample_count,
-            4
-        );
+        let name = "checkout_latency_ms";
+        assert_eq!(aggregate(&store, name, Aggregation::Sum)?.value, 10.0);
+        assert_eq!(aggregate(&store, name, Aggregation::Avg)?.value, 2.5);
+        assert_eq!(aggregate(&store, name, Aggregation::Min)?.value, 1.0);
+        assert_eq!(aggregate(&store, name, Aggregation::Max)?.value, 4.0);
+        assert_eq!(aggregate(&store, name, Aggregation::Count)?.sample_count, 4);
+        Ok(())
     }
 
     #[test]
     fn unknown_metric_returns_none() {
         let store = CustomMetricsStore::default();
-        assert!(store.aggregate("does-not-exist", Aggregation::Avg).is_none());
+        assert!(store
+            .aggregate("does-not-exist", Aggregation::Avg)
+            .is_none());
     }
 
     #[test]
@@ -331,13 +586,176 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_share_round_trips() {
+    fn dashboard_share_round_trips() -> TestResult {
         let store = CustomMetricsStore::default();
         let share = store.create_share(CreateShareRequest {
             dashboard: "vault-lifecycle".to_string(),
             created_by: Some("alice".to_string()),
         });
-        let resolved = store.resolve_share(&share.token).expect("share should resolve");
+        let resolved = store
+            .resolve_share(&share.token)
+            .ok_or("share should resolve")?;
         assert_eq!(resolved.dashboard, "vault-lifecycle");
+        Ok(())
+    }
+
+    fn definition(name: &str, kind: MetricKind) -> MetricDefinition {
+        MetricDefinition {
+            name: name.to_string(),
+            kind,
+            description: None,
+            unit: None,
+        }
+    }
+
+    fn tags(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn metric_names_and_label_names_follow_prometheus_rules() {
+        assert!(is_valid_metric_name("vault_releases_total"));
+        assert!(is_valid_metric_name("ns:rate"));
+        assert!(!is_valid_metric_name("9starts_with_digit"));
+        assert!(!is_valid_metric_name("has-dash"));
+        assert!(!is_valid_metric_name(""));
+
+        assert!(is_valid_label_name("region"));
+        assert!(!is_valid_label_name("__reserved"));
+        assert!(!is_valid_label_name("bad-label"));
+    }
+
+    #[test]
+    fn validate_point_rejects_non_finite_values_and_bad_labels() {
+        assert!(validate_point("ok_metric", 1.0, &HashMap::new()).is_ok());
+        assert!(matches!(
+            validate_point("ok_metric", f64::NAN, &HashMap::new()),
+            Err(MetricError::NonFiniteValue { .. })
+        ));
+        assert!(matches!(
+            validate_point("ok_metric", f64::INFINITY, &HashMap::new()),
+            Err(MetricError::NonFiniteValue { .. })
+        ));
+        assert!(matches!(
+            validate_point("ok_metric", 1.0, &tags(&[("bad-key", "x")])),
+            Err(MetricError::InvalidLabel { .. })
+        ));
+        assert!(matches!(
+            validate_point("bad name", 1.0, &HashMap::new()),
+            Err(MetricError::InvalidName(_))
+        ));
+    }
+
+    #[test]
+    fn defined_metric_round_trips_and_lists_sorted() -> TestResult {
+        let store = CustomMetricsStore::default();
+        store.define_metric(definition("zeta_gauge", MetricKind::Gauge))?;
+        store.define_metric(definition("alpha_total", MetricKind::Counter))?;
+
+        let names: Vec<String> = store.definitions().into_iter().map(|d| d.name).collect();
+        assert_eq!(names, vec!["alpha_total", "zeta_gauge"]);
+        Ok(())
+    }
+
+    #[test]
+    fn redefining_with_the_same_kind_updates_metadata() -> TestResult {
+        let store = CustomMetricsStore::default();
+        store.define_metric(definition("payouts", MetricKind::Counter))?;
+        store.define_metric(MetricDefinition {
+            description: Some("Payouts processed".to_string()),
+            ..definition("payouts", MetricKind::Counter)
+        })?;
+
+        let defs = store.definitions();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].description.as_deref(), Some("Payouts processed"));
+        Ok(())
+    }
+
+    #[test]
+    fn redefining_with_a_different_kind_is_rejected() -> TestResult {
+        let store = CustomMetricsStore::default();
+        store.define_metric(definition("payouts", MetricKind::Counter))?;
+        let err = store
+            .define_metric(definition("payouts", MetricKind::Gauge))
+            .err()
+            .ok_or("duplicate name with a different kind must be rejected")?;
+        assert_eq!(
+            err,
+            MetricError::KindConflict {
+                name: "payouts".to_string(),
+                existing: MetricKind::Counter,
+            }
+        );
+        assert!(err.to_string().contains("already defined as a counter"));
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_definition_name_is_rejected() {
+        let store = CustomMetricsStore::default();
+        let result = store.define_metric(definition("not valid", MetricKind::Gauge));
+        assert_eq!(result, Err(MetricError::InvalidName("not valid".to_string())));
+        assert!(store.definitions().is_empty());
+    }
+
+    #[test]
+    fn metric_errors_map_to_http_statuses() {
+        let invalid = MetricError::InvalidName("x y".to_string());
+        assert_eq!(invalid.status_code(), StatusCode::BAD_REQUEST);
+
+        let non_finite = MetricError::NonFiniteValue { name: "m".to_string() };
+        assert_eq!(non_finite.into_response().status(), StatusCode::BAD_REQUEST);
+
+        let conflict = MetricError::KindConflict {
+            name: "m".to_string(),
+            existing: MetricKind::Gauge,
+        };
+        assert_eq!(conflict.into_response().status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn export_renders_counter_sum_and_gauge_latest_per_label_set() -> TestResult {
+        let store = CustomMetricsStore::default();
+        store.define_metric(MetricDefinition {
+            name: "vault_releases_total".to_string(),
+            kind: MetricKind::Counter,
+            description: Some("Releases per region".to_string()),
+            unit: None,
+        })?;
+        store.define_metric(definition("vault_balance", MetricKind::Gauge))?;
+
+        store.record("vault_releases_total", 2.0, tags(&[("region", "eu")]));
+        store.record("vault_releases_total", 3.0, tags(&[("region", "eu")]));
+        store.record("vault_releases_total", 1.0, tags(&[("region", "us")]));
+        store.record("vault_balance", 10.0, HashMap::new());
+        store.record("vault_balance", 42.0, HashMap::new());
+
+        let text = store.export_prometheus();
+        assert!(text.contains("# HELP vault_releases_total Releases per region\n"));
+        assert!(text.contains("# TYPE vault_releases_total counter\n"));
+        assert!(text.contains("vault_releases_total{region=\"eu\"} 5\n"));
+        assert!(text.contains("vault_releases_total{region=\"us\"} 1\n"));
+        assert!(text.contains("# TYPE vault_balance gauge\n"));
+        assert!(text.contains("vault_balance 42\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn export_marks_undefined_metrics_untyped_and_escapes_label_values() {
+        let store = CustomMetricsStore::default();
+        store.record("adhoc_metric", 7.0, tags(&[("note", "say \"hi\"\\")]));
+        let text = store.export_prometheus();
+        assert!(text.contains("# TYPE adhoc_metric untyped\n"));
+        assert!(text.contains(r#"adhoc_metric{note="say \"hi\"\\"} 7"#));
+    }
+
+    #[test]
+    fn export_of_empty_store_is_empty() {
+        assert!(CustomMetricsStore::default().export_prometheus().is_empty());
     }
 }

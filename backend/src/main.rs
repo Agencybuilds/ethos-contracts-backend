@@ -1,9 +1,12 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
+    body::Body,
     extract::State,
-    http::{HeaderValue, Method, StatusCode},
+    http::{HeaderValue, Method, Request, StatusCode},
+    middleware::Next,
+    response::Response,
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -11,24 +14,56 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
+    acl::{acl_audit_trail, create_acl_rule, delete_acl_rule, list_acl_rules, AclStore},
+    alert_rules::{
+        create_alert_rule, delete_alert_rule, evaluate_alerts, get_alert_rule, list_alert_rules,
+        list_fired_alerts, AlertRulesState,
+    },
     aml::{check_address, flag_address, list_flags as list_aml_flags, unflag_address, AmlScreener},
     anomaly_detection::{
         configure_seasonality, get_baseline, get_investigation_history, get_seasonal_pattern,
-        list_alerts, list_root_causes, list_system_anomalies, observe_metric,
-        record_investigation, set_seasonal_threshold, AnomalyStore,
+        list_alerts, list_root_causes, list_system_anomalies, observe_metric, record_investigation,
+        set_seasonal_threshold, AnomalyStore,
+    },
+    automated_rollback::{
+        create_rollback_plan, get_rollback_plan, list_rollback_history, list_rollback_plans,
+        run_post_deployment_tests, trigger_rollback, RollbackState,
     },
     batching::{AdaptiveBatcher, BatchConfig},
+    blue_green::{
+        create_blue_green_deployment, get_blue_green_deployment, list_blue_green_deployments,
+        report_health as bg_report_health, rollback_blue_green, switch_traffic, BlueGreenState,
+    },
+    canary::{
+        evaluate_canary, get_canary_deployment, rollback_canary, start_canary_deployment,
+        CanaryState,
+    },
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
-    // cost_tracking::{allocate_cost, get_cost_report, record_cost_entry, CostState},
-    // Commented out: custom_metrics unused in current build
-    // custom_metrics::{
-    //     aggregate_custom_metric, create_dashboard_share, get_shared_dashboard, list_custom_metrics,
-    //     list_dashboard_templates, record_custom_metric, CustomMetricsStore,
-    // },
+    cost_estimation::estimate_cost_handler,
+    cost_tracking::{
+        allocate_cost, get_budget_breaches, get_cost_dashboard, get_cost_report,
+        get_gas_cost_report, get_optimization_suggestions, record_cost_entry, record_gas_cost,
+        set_budget_threshold, CostState,
+    },
+    dr_automation::{
+        confirm_dr_action, get_dr_test_schedule, get_rto_rpo, list_playbooks, request_dr_action,
+        DrAutomationState,
+    },
+    custom_metrics::{
+        aggregate_custom_metric, create_dashboard_share, define_custom_metric,
+        export_custom_metrics, get_shared_dashboard, list_custom_metric_definitions,
+        list_custom_metrics, list_dashboard_templates, record_custom_metric, CustomMetricsStore,
+    },
+    log_patterns::analyze_logs,
+    realtime_dashboard::{
+        add_metric_alert_rule, drill_down_metric, get_dashboard_snapshot, ingest_metric,
+        stream_metrics, RealtimeDashboard,
+    },
+    uptime::{get_downtime_alerts, get_uptime_report, record_uptime_check, UptimeMonitor},
     db::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
-        create_vault_store, AppState, Db, PoolConfig,
+        create_vault_store, resolve_db_path, AppState, Db, PoolConfig,
     },
     decompression::DecompressionConfig,
     degradation::{
@@ -37,26 +72,47 @@ use ethos_protocol_backend::{
     },
     event_sourcing::EventSourcingState,
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
+    fraud_detection::{self, FraudDetector},
     graphql::{build_schema, graphql_handler, graphql_playground},
     jobs::{
-        self, cancel_job_handler, create_job_handler, get_job_handler, list_jobs_handler,
-        JobStatus,
+        cancel_job_handler, create_job_handler, create_job_store, get_job_handler,
+        list_jobs_handler,
     },
+    health::health_handler,
     load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
+    log_analysis::log_analysis_router,
     message_queue::MessageQueueState,
     metrics::Metrics,
     predictive_scaling::{
         self, ForecastModel, LoggingAutoscalerClient, PredictiveScaler, ScalingConfig,
     },
     priority::{PriorityConfig, PriorityEnforcer},
-    rate_limit::{enforce_rate_limit, RateLimiter, TierLimit},
+    rate_limit::{enforce_rate_limit, EndpointConfig, RateLimiter, TierLimit, UserTier},
+    replay::{
+        batch_replay_handler, create_request_log_store, get_log_handler, list_logs_handler,
+        replay_handler,
+    },
     routes,
     rpc_pool::{RpcPool, RpcPoolConfig},
     scheduler,
+    saml::{self, AttributeMapping, SamlConfig, SamlState},
     schema_validation::{openapi_validation_middleware, OpenApiSpec},
+    sla::{
+        create_sla_policy, delete_sla_policy, get_compliance_summary, get_sla_policy,
+        get_sla_report, list_sla_breaches, list_sla_policies, record_sla_measurement,
+        update_sla_policy, SlaState,
+    },
     streaming::{stream_events, stream_vaults},
+    token_revocation::revoke_token,
     timeout_policy::TimeoutState,
     tracing_sampling::TraceSampler,
+    timeseries::{
+        benchmark_handler, compress_handler, create_timeseries_store, ingest_handler,
+        query_handler, set_retention_handler,
+    },
+    two_factor::{
+        challenge_2fa, clear_2fa_session, disable_2fa, enable_2fa, get_2fa_status, verify_2fa,
+    },
     webauthn::{
         add_backup_authenticator, begin_authentication, begin_registration,
         complete_authentication, complete_registration, list_credentials, remove_credential,
@@ -66,7 +122,58 @@ use ethos_protocol_backend::{
 };
 
 #[cfg(test)]
+mod stellar_integration_tests;
+#[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod http_duration_metrics_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn metrics_endpoint_exports_http_request_duration_histogram() {
+        let state = AppState::for_tests();
+        let app = build_router(state);
+
+        // Drive one request through the middleware so the histogram has samples.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            text.contains("ethos_protocol_http_request_duration_seconds"),
+            "metrics output missing request duration histogram:\n{text}"
+        );
+        assert!(
+            text.contains("ethos_protocol_http_request_duration_seconds_bucket"),
+            "metrics output missing request duration histogram buckets:\n{text}"
+        );
+    }
+}
 
 fn build_cors_layer() -> CorsLayer {
     let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_default();
@@ -91,11 +198,51 @@ fn build_cors_layer() -> CorsLayer {
         .allow_headers(tower_http::cors::Any)
 }
 
-async fn health_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
+/// Records every HTTP request's duration into the
+/// `ethos_protocol_http_request_duration_seconds` histogram (#947).
+///
+/// The `EthosHighApiLatencyP99` alert and the latency dashboards query the
+/// `_bucket` series of this metric, so it must be exported from `/metrics`.
+async fn http_duration_middleware(request: Request<Body>, next: Next) -> Response {
+    let method = request.method().as_str().to_string();
+    let path = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|matched| matched.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string());
+
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let elapsed = started.elapsed().as_secs_f64();
+    let status = response.status().as_u16().to_string();
+
+    ethos_protocol_backend::metrics::observe_http_request_duration(
+        &method, &path, &status, elapsed,
+    );
+
+    response
+}
+
+async fn profile_http_request(
+    State(profiler): State<Arc<ethos_protocol_backend::profiler::ProfilerState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = request.method().as_str().to_string();
+    let path = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|matched| matched.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string());
+    let operation = format!("{method} {path}");
+
+    ethos_protocol_backend::profiler::profile_operation(
+        &profiler,
+        &operation,
+        &["http"],
+        || async move { next.run(request).await },
+    )
+    .await
 }
 
 /// GET /api/encryption/keys — list all known encryption key versions (#101).
@@ -108,17 +255,9 @@ async fn encryption_keys_handler(
     }
 }
 
-async fn ready_handler(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    match state.db.check_connectivity() {
-        Ok(()) => Ok(Json(serde_json::json!({
-            "status": "ok",
-            "version": env!("CARGO_PKG_VERSION"),
-            "database": "connected",
-        }))),
-        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
-    }
+/// GET /ready — 200 when every required subsystem passes, else 503 (#698).
+async fn ready_handler(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    ethos_protocol_backend::readiness::ready_response(&state).await
 }
 
 /// Prometheus text-format metrics for scraping, combining base counters
@@ -129,6 +268,7 @@ async fn metrics_handler(State(state): State<AppState>) -> String {
     out.push_str(&state.load_shedder.render_prometheus());
     out.push_str(&state.batcher.render_prometheus());
     out.push_str(&state.scaler.render_prometheus());
+    out.push_str(&ethos_protocol_backend::metrics::render_http_request_duration());
     out
 }
 
@@ -158,23 +298,129 @@ pub fn build_router(state: AppState) -> Router {
     // let retry_state = RetryPolicyState::new();
     // let bulkhead_registry = Arc::new(BulkheadRegistry::new(BulkheadConfig::default()));
     let _timeout_state = TimeoutState::new();
+    let two_factor_router = Router::new()
+        .route(
+            "/api/vaults/:vault_id/2fa/status",
+            get(get_2fa_status),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/enable",
+            post(enable_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/verify",
+            post(verify_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/disable",
+            post(disable_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/challenge",
+            post(challenge_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/session/clear",
+            post(clear_2fa_session),
+        )
+        .with_state(Arc::clone(&state.db));
 
     Router::new()
+        .merge(two_factor_router)
         // ── Feature flags (#274) ─────────────────────────────────────────────
         .route("/admin/flags", post(upsert_flag).get(list_flags))
         .route("/admin/flags/:key", get(get_flag))
         .route("/admin/flags/:key/evaluate", post(evaluate_flag_handler))
+        .route("/estimate-cost", post(estimate_cost_handler))
         // ── Health ──────────────────────────────────────────────────────────
         .route("/health", get(health_handler))
         .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
         .route("/metrics", get(metrics_handler))
-        // ── Persistent bulk jobs ────────────────────────────────────────────
-        .route("/jobs", post(create_job_handler).get(list_jobs_handler))
+        .route("/auth/revoke", post(revoke_token))
         .route(
-            "/jobs/:job_id",
-            get(get_job_handler).delete(cancel_job_handler),
+            "/api/notifications/register",
+            post(ethos_protocol_backend::notifications::register_token)
+                .delete(ethos_protocol_backend::notifications::unregister_token),
         )
+        .route(
+            "/api/notifications/preferences",
+            get(ethos_protocol_backend::notifications::get_preferences)
+                .put(ethos_protocol_backend::notifications::update_preferences),
+        )
+        .route(
+            "/api/notifications/delivery",
+            get(ethos_protocol_backend::notifications::get_delivery_log),
+        )
+        .route(
+            "/admin/notifications/schedule",
+            post(ethos_protocol_backend::notifications::schedule_notification),
+        )
+        .route(
+            "/admin/notifications/flush",
+            post(ethos_protocol_backend::notifications::flush_pending_handler),
+        )
+        .route(
+            "/admin/notifications/:notification_id/deliver-with-fallback",
+            post(ethos_protocol_backend::notifications::deliver_with_fallback_handler),
+        )
+        .route(
+            "/api/tenants",
+            post(routes::create_tenant),
+        )
+        .route(
+            "/api/tenants/:tenant_id/vaults",
+            get(routes::get_tenant_vaults),
+        )
+        .route(
+            "/api/tenants/:tenant_id/vaults/:vault_id",
+            post(routes::add_vault_to_tenant),
+        )
+        .route("/api/tenants/billing", get(routes::get_tenant_billing))
+        .route(
+            "/admin/profiler/samples",
+            get(ethos_protocol_backend::profiler::list_samples),
+        )
+        .route(
+            "/admin/profiler/flamegraph",
+            get(ethos_protocol_backend::profiler::get_flamegraph),
+        )
+        .route(
+            "/admin/profiler/baseline",
+            post(ethos_protocol_backend::profiler::set_baseline),
+        )
+        .route(
+            "/admin/profiler/regressions",
+            get(ethos_protocol_backend::profiler::get_regressions),
+        )
+        .route(
+            "/admin/profiler/overhead",
+            get(ethos_protocol_backend::profiler::get_overhead),
+        )
+        // ── CAPTCHA challenge / verification (#97) ────────────────────────
+        .route(
+            "/captcha/challenge",
+            post(ethos_protocol_backend::captcha::post_challenge_handler),
+        )
+        .route(
+            "/captcha/verify",
+            post(ethos_protocol_backend::captcha::post_verify_handler),
+        )
+        .route(
+            "/admin/captcha/trusted-users",
+            get(ethos_protocol_backend::captcha::get_trusted_users_handler)
+                .post(ethos_protocol_backend::captcha::post_add_trusted_user_handler),
+        )
+        .route(
+            "/admin/compliance-report",
+            get(ethos_protocol_backend::compliance::compliance_report_handler),
+        )
+        // ── Enterprise SSO ──────────────────────────────────────────────────
+        .route("/saml/metadata", get(saml::get_metadata))
+        .route("/saml/login", get(saml::initiate_login))
+        .route("/saml/acs", post(saml::assertion_consumer_service))
+        // ── Fraud detection ──────────────────────────────────────────────────
+        .route("/fraud/score", post(fraud_detection::score_transaction))
         // ── Graceful degradation routes ─────────────────────────────────────
         .route(
             "/admin/capabilities",
@@ -205,12 +451,51 @@ pub fn build_router(state: AppState) -> Router {
         .route("/webhooks", post(register_webhook).get(list_webhooks))
         .route("/webhooks/:id", delete(delete_webhook))
         .route("/webhooks/verify", post(verify_webhook))
+        // ── Dead-letter queue operator routes ────────────────────────────────
+        .route(
+            "/admin/dlq",
+            get(ethos_protocol_backend::dlq::list_dlq_entries),
+        )
+        .route(
+            "/admin/dlq/replay",
+            post(ethos_protocol_backend::dlq::replay_dlq_entries),
+        )
+        // ── Data retention operator routes (#100) ────────────────────────────
+        .route(
+            "/api/retention/policies/:data_type",
+            put(ethos_protocol_backend::retention::upsert_policy),
+        )
+        .route(
+            "/api/retention/purge/:data_type",
+            post(ethos_protocol_backend::retention::trigger_purge),
+        )
+        .route(
+            "/api/retention/exceptions/:data_type",
+            post(ethos_protocol_backend::retention::add_exception),
+        )
+        .route(
+            "/api/retention/deletion-log",
+            get(ethos_protocol_backend::retention::get_deletion_log),
+        )
         // ── GraphQL routes (#66) ─────────────────────────────────────────────
         .route("/graphql", post(graphql_handler))
         .route("/graphql/playground", get(graphql_playground))
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── Authenticated WebSocket vault streams ────────────────────────────
+        .route(
+            "/ws/vaults",
+            get(ethos_protocol_backend::websocket::authenticated_vault_websocket_handler),
+        )
+        .route(
+            "/ws/vaults/:vault_id",
+            get(ethos_protocol_backend::websocket::vault_websocket_handler),
+        )
+        .route(
+            "/ws/vaults/:vault_id/heartbeat",
+            get(ethos_protocol_backend::websocket::heartbeat_vault_websocket_handler),
+        )
         // ── Request prioritization / load shedding (#128, #129) ──────────────
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -230,8 +515,55 @@ pub fn build_router(state: AppState) -> Router {
             Arc::new(build_rate_limiter()),
             enforce_rate_limit,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.profiler_state.clone(),
+            profile_http_request,
+        ))
+        // ── HTTP request duration histogram (#947) ─────────────────────────
+        // Feeds `ethos_protocol_http_request_duration_seconds` used by the
+        // EthosHighApiLatencyP99 alert and the latency dashboards.
+        .layer(axum::middleware::from_fn(http_duration_middleware))
         .layer(build_cors_layer())
         .with_state(state)
+}
+
+fn build_operational_router() -> Router {
+    let timeseries_router = Router::new()
+        .route("/timeseries/ingest", post(ingest_handler))
+        .route("/timeseries/query", post(query_handler))
+        .route(
+            "/timeseries/:series/compress",
+            post(compress_handler),
+        )
+        .route(
+            "/timeseries/:series/retention",
+            post(set_retention_handler),
+        )
+        .route(
+            "/timeseries/:series/benchmark",
+            post(benchmark_handler),
+        )
+        .with_state(create_timeseries_store());
+
+    let jobs_router = Router::new()
+        .route("/jobs", post(create_job_handler).get(list_jobs_handler))
+        .route(
+            "/jobs/:job_id",
+            get(get_job_handler).delete(cancel_job_handler),
+        )
+        .with_state(create_job_store());
+
+    let replay_router = Router::new()
+        .route("/replay", post(replay_handler))
+        .route("/replay/batch", post(batch_replay_handler))
+        .route("/replay/logs", get(list_logs_handler))
+        .route("/replay/logs/:log_id", get(get_log_handler))
+        .with_state(create_request_log_store());
+
+    Router::new()
+        .merge(timeseries_router)
+        .merge(jobs_router)
+        .merge(replay_router)
 }
 
 /// Rate limiter used by [`enforce_rate_limit`] for the whole app (#348).
@@ -243,7 +575,16 @@ fn build_rate_limiter() -> RateLimiter {
 
     // Global default for authenticated tiers on endpoints without a specific
     // entry: 300 requests / minute.
-    RateLimiter::new(TierLimit::new(300, Duration::from_secs(60)))
+    let mut limiter = RateLimiter::new(TierLimit::new(300, Duration::from_secs(60)));
+    let mut fraud_scoring = EndpointConfig::new();
+    fraud_scoring.set_tier_limit(UserTier::Free, TierLimit::new(30, Duration::from_secs(60)));
+    fraud_scoring.set_tier_limit(UserTier::Pro, TierLimit::new(120, Duration::from_secs(60)));
+    fraud_scoring.set_tier_limit(
+        UserTier::Enterprise,
+        TierLimit::new(600, Duration::from_secs(60)),
+    );
+    limiter.register_endpoint("POST /fraud/score", fraud_scoring);
+    limiter
 }
 
 #[tokio::main]
@@ -251,6 +592,9 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
+
+    // #905: never start with admin auth disabled outside a development machine.
+    backend::audit::refuse_insecure_admin_outside_development();
 
     // Check contract version before proceeding with server startup
     let min_contract_version =
@@ -312,28 +656,56 @@ async fn main() {
         "database pool configuration"
     );
 
+    // #690: vault, subscription and audit data must survive restarts, so the
+    // database is a file on a persistent volume. `:memory:` needs an explicit opt-in.
+    let allow_ephemeral_db = std::env::var("ALLOW_EPHEMERAL_DB").is_ok_and(|v| v == "true");
+    let db_path =
+        match resolve_db_path(std::env::var("DB_PATH").ok().as_deref(), allow_ephemeral_db) {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!("{err}");
+                std::process::exit(1);
+            }
+        };
+    if let Some(parent) = std::path::Path::new(&db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            tracing::error!(dir = %parent.display(), "cannot create database directory: {err}");
+            std::process::exit(1);
+        }
+    }
+    tracing::info!(db_path = %db_path, "opening database");
+
     let db =
-        Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
+        Arc::new(Db::open_with_pool_config(&db_path, &pool_config).expect("failed to open db"));
+    // Log what the pool actually runs with, not just what was requested (#696).
+    tracing::info!(
+        read_connections_max = db.max_read_connections(),
+        read_connections_open = db.open_read_connections(),
+        write_connections = 1,
+        "database connection pool initialized"
+    );
     db.migrate().expect("migration failed");
 
-    let job_db_path =
-        std::env::var("JOB_QUEUE_DB_PATH").unwrap_or_else(|_| "jobs.sqlite3".to_string());
-    let job_store = jobs::open_job_store(&job_db_path).expect("failed to open bulk job store");
-    for job in jobs::list_jobs(&job_store, Some(JobStatus::Queued))
-        .expect("failed to load queued jobs")
-    {
-        jobs::spawn_job(job_store.clone(), job.id);
-    }
+    // Keep the sampler alive for the duration of the process. The RPC pool is
+    // shared through AppState so `/ready` can probe it (#698).
+    let _ = sampler;
+    let rpc_pool = Arc::new(rpc_pool);
 
-    // Keep sampler and rpc_pool alive for the duration of the process.
-    // They are logged at startup; full integration into AppState is done when
-    // handlers need them directly.
-    let _ = (rpc_pool, sampler);
-
-    let consensus = NodeCache::from_env();
+    // #699: an unrecognised CONSENSUS_STRATEGY aborts startup rather than
+    // silently running with last-write-wins.
+    let consensus = match NodeCache::from_env() {
+        Ok(consensus) => consensus,
+        Err(err) => {
+            tracing::error!("{err}");
+            std::process::exit(1);
+        }
+    };
     tracing::info!(
         node_id = consensus.node_id(),
-        strategy = ?consensus.strategy(),
+        strategy = consensus.strategy().as_str(),
         "consensus cache initialized"
     );
 
@@ -374,6 +746,10 @@ async fn main() {
     let webhook_state = Arc::new(WebhookState::new());
 
     let flag_state = Arc::new(FlagState::new(Arc::clone(&db)));
+    let saml_state = SamlConfig::from_env()
+        .expect("invalid SAML configuration")
+        .map(|config| Arc::new(SamlState::new(config, AttributeMapping::default())))
+        .unwrap_or_else(|| Arc::new(SamlState::disabled()));
 
     let state = AppState {
         db: Arc::clone(&db),
@@ -384,6 +760,10 @@ async fn main() {
         share_token_store: create_share_token_store(),
         consensus,
         webhook_state,
+        vault_broadcaster: Arc::new(ethos_protocol_backend::websocket::VaultBroadcaster::new(
+            1024,
+        )),
+        request_log_store: ethos_protocol_backend::replay::create_request_log_store(),
         graphql_schema,
         metrics,
         priority_enforcer,
@@ -398,8 +778,24 @@ async fn main() {
         flag_state,
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
-        job_store,
+        rpc_pool,
+        incident_state: Arc::new(ethos_protocol_backend::incidents::IncidentState::new()),
+        token_revocations: ethos_protocol_backend::token_revocation::RevocationList::new(),
+        notification_service: ethos_protocol_backend::notifications::create_service(),
+        profiler_state: Arc::new(ethos_protocol_backend::profiler::ProfilerState::new()),
+        saml_state,
+        fraud_detector: FraudDetector::new(),
     };
+
+    let notification_interval_secs = std::env::var("NOTIFICATION_SCHEDULER_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(60);
+    ethos_protocol_backend::notifications::start_scheduler(
+        Arc::clone(&state.notification_service),
+        notification_interval_secs,
+    );
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────
     // NOTE: ACL functionality is pending implementation.
@@ -412,22 +808,57 @@ async fn main() {
     //     .route("/admin/acl/audit", get(acl_audit_trail))
     //     .with_state(acl_store);
 
-    // ── Custom metrics + Grafana dashboard routes ────────────────────────
-    // NOTE: Custom metrics functionality is pending implementation.
-    // let custom_metrics_store = CustomMetricsStore::new();
-    // let custom_metrics_router = Router::new()
-    //     .route(
-    //         "/metrics/custom",
-    //         post(record_custom_metric).get(list_custom_metrics),
-    //     )
-    //     .route(
-    //         "/metrics/custom/:name/aggregate",
-    //         get(aggregate_custom_metric),
-    //     )
-    //     .route("/dashboards/templates", get(list_dashboard_templates))
-    //     .route("/dashboards/share", post(create_dashboard_share))
-    //     .route("/dashboards/shared/:token", get(get_shared_dashboard))
-    //     .with_state(custom_metrics_store);
+    // ── Custom metrics + Grafana dashboard routes (#604) ─────────────────
+    let custom_metrics_store = CustomMetricsStore::new();
+    let custom_metrics_router = Router::new()
+        .route(
+            "/metrics/custom",
+            post(record_custom_metric).get(list_custom_metrics),
+        )
+        .route(
+            "/metrics/custom/definitions",
+            post(define_custom_metric).get(list_custom_metric_definitions),
+        )
+        .route("/metrics/custom/export", get(export_custom_metrics))
+        .route(
+            "/metrics/custom/:name/aggregate",
+            get(aggregate_custom_metric),
+        )
+        .route("/dashboards/templates", get(list_dashboard_templates))
+        .route("/dashboards/share", post(create_dashboard_share))
+        .route("/dashboards/shared/:token", get(get_shared_dashboard))
+        .with_state(custom_metrics_store);
+
+    // ── Cost tracking routes (#594) ────────────────────────────────────────
+    // Records per-operation cost entries (fiat + gas), surfaces dashboards,
+    // budget thresholds / breach alerts, and optimization suggestions.
+    let cost_state = Arc::new(CostState::new());
+    let cost_router = Router::new()
+        .route("/admin/cost/entries", post(record_cost_entry))
+        .route("/admin/cost/report", get(get_cost_report))
+        .route("/admin/cost/allocate", post(allocate_cost))
+        .route("/admin/cost/budget-thresholds", post(set_budget_threshold))
+        .route("/admin/cost/budget-breaches", get(get_budget_breaches))
+        .route("/admin/cost/gas", post(record_gas_cost))
+        .route("/admin/cost/gas/report", get(get_gas_cost_report))
+        .route("/admin/cost/dashboard", get(get_cost_dashboard))
+        .route(
+            "/admin/cost/optimizations",
+            get(get_optimization_suggestions),
+        )
+        .with_state(cost_state);
+
+    // ── Disaster recovery automation routes (#595) ─────────────────────────
+    // Two-phase destructive-action API mirroring docs/disaster-recovery-runbook.md,
+    // plus RTO/RPO targets, DR test schedule, and incident response playbooks.
+    let dr_state = Arc::new(DrAutomationState::new());
+    let dr_router = Router::new()
+        .route("/admin/dr/actions", post(request_dr_action))
+        .route("/admin/dr/actions/:token/confirm", post(confirm_dr_action))
+        .route("/admin/dr/rto-rpo", get(get_rto_rpo))
+        .route("/admin/dr/test-schedule", get(get_dr_test_schedule))
+        .route("/admin/dr/playbooks", get(list_playbooks))
+        .with_state(dr_state);
 
     // ── Anomaly detection routes (#544 seasonal, #545 correlation, #546 investigations)
     let anomaly_store = AnomalyStore::new();
@@ -439,7 +870,10 @@ async fn main() {
             "/anomaly/seasonality",
             post(configure_seasonality).get(get_seasonal_pattern),
         )
-        .route("/anomaly/seasonality/threshold", put(set_seasonal_threshold))
+        .route(
+            "/anomaly/seasonality/threshold",
+            put(set_seasonal_threshold),
+        )
         .route("/anomaly/system", get(list_system_anomalies))
         .route("/anomaly/root-causes", get(list_root_causes))
         .route(
@@ -457,15 +891,14 @@ async fn main() {
         .with_state(aml_screener);
 
     // ── Structured log parsing / search routes ───────────────────────────
-    // NOTE: Log parsing/search is pending implementation.
-    // let log_store = LogStore::new();
-    // let log_router = Router::new()
-    //     .route("/logs/ingest", post(ingest_logs))
-    //     .route("/logs/search", get(search_logs))
-    //     .with_state(log_store);
+    let log_router = log_analysis_router();
 
     // ── WebAuthn / FIDO2 routes (#148) ────────────────────────────────────
-    let webauthn_state = Arc::new(WebAuthnState::from_env());
+    // Fail startup on a missing or inconsistent relying-party config (#695).
+    let webauthn_state = Arc::new(
+        WebAuthnState::from_env()
+            .unwrap_or_else(|err| panic!("invalid WebAuthn configuration: {err}")),
+    );
     let webauthn_router = Router::new()
         .route("/webauthn/register/begin", post(begin_registration))
         .route("/webauthn/register/complete", post(complete_registration))
@@ -485,15 +918,152 @@ async fn main() {
         )
         .with_state(webauthn_state);
 
+    // ── Issue #590: Alert Rules for Critical Events ───────────────────────────
+    let alert_rules_state = Arc::new(AlertRulesState::new());
+    // Built but not mounted yet (see the `.merge` list below); the explicit
+    // type keeps the unmounted router compiling.
+    let alert_rules_router: Router = Router::new()
+        .route(
+            "/alerts/rules",
+            post(create_alert_rule).get(list_alert_rules),
+        )
+        .route(
+            "/alerts/rules/:id",
+            get(get_alert_rule).delete(delete_alert_rule),
+        )
+        .route("/alerts/evaluate", post(evaluate_alerts))
+        .route("/alerts/fired", get(list_fired_alerts))
+        .with_state(alert_rules_state);
+
+    // ── Issue #591: Canary Deployment ─────────────────────────────────────────
+    let canary_state = Arc::new(CanaryState::new());
+    // Built but not mounted yet (see the `.merge` list below); the explicit
+    // type keeps the unmounted router compiling.
+    let canary_router: Router = Router::new()
+        .route(
+            "/deployments/canary",
+            post(start_canary_deployment),
+        )
+        .route(
+            "/deployments/canary/:id",
+            get(get_canary_deployment),
+        )
+        .route(
+            "/deployments/canary/:id/evaluate",
+            post(evaluate_canary),
+        )
+        .route(
+            "/deployments/canary/:id/rollback",
+            post(rollback_canary),
+        )
+        .with_state(canary_state);
+
+    // ── Issue #592: Blue-Green Deployment ─────────────────────────────────────
+    let blue_green_state = Arc::new(BlueGreenState::new());
+    // Built but not mounted yet (see the `.merge` list below); the explicit
+    // type keeps the unmounted router compiling.
+    let blue_green_router: Router = Router::new()
+        .route(
+            "/deployments/blue-green",
+            post(create_blue_green_deployment).get(list_blue_green_deployments),
+        )
+        .route(
+            "/deployments/blue-green/:id",
+            get(get_blue_green_deployment),
+        )
+        .route("/deployments/blue-green/:id/switch", post(switch_traffic))
+        .route(
+            "/deployments/blue-green/:id/rollback",
+            post(rollback_blue_green),
+        )
+        .route("/deployments/blue-green/:id/health", post(bg_report_health))
+        .with_state(blue_green_state);
+
+    // ── Issue #593: Automated Rollback on Test Failure ────────────────────────
+    let rollback_state = Arc::new(RollbackState::new());
+    // Built but not mounted yet (see the `.merge` list below); the explicit
+    // type keeps the unmounted router compiling.
+    let rollback_router: Router = Router::new()
+        .route(
+            "/deployments/rollback/plan",
+            post(create_rollback_plan).get(list_rollback_plans),
+        )
+        .route("/deployments/rollback/plan/:id", get(get_rollback_plan))
+        .route(
+            "/deployments/rollback/plan/:id/run-tests",
+            post(run_post_deployment_tests),
+        )
+        .route(
+            "/deployments/rollback/plan/:id/rollback",
+            post(trigger_rollback),
+        )
+        .route("/deployments/rollback/history", get(list_rollback_history))
+        .with_state(rollback_state);
+
+    // ── Issue #600: SLA Monitoring and Reporting ───────────────────────────────
+    // Tracks per-service SLA policies, records compliance measurements, detects
+    // breaches in real time, and surfaces compliance reports.
+    let sla_state = Arc::new(SlaState::new());
+    let sla_router = Router::new()
+        .route(
+            "/sla/policies",
+            post(create_sla_policy).get(list_sla_policies),
+        )
+        .route(
+            "/sla/policies/:id",
+            get(get_sla_policy)
+                .put(update_sla_policy)
+                .delete(delete_sla_policy),
+        )
+        .route("/sla/records", post(record_sla_measurement))
+        .route("/sla/report", get(get_sla_report))
+        .route("/sla/breaches", get(list_sla_breaches))
+        .route("/sla/compliance", get(get_compliance_summary))
+        .with_state(sla_state);
+
+    // ── Log pattern analysis (#603) ──────────────────────────────────────
+    // Stateless: the posted lines are analysed and discarded. The in-memory
+    // LogStore (ingest/search) is still not mounted because it has no size
+    // cap and would grow without bound.
+
+    // ── Uptime monitoring (#601) ─────────────────────────────────────────
+    let uptime_monitor = UptimeMonitor::new();
+    let uptime_router = Router::new()
+        .route("/uptime/checks", post(record_uptime_check))
+        .route("/uptime/report", get(get_uptime_report))
+        .route("/uptime/alerts", get(get_downtime_alerts))
+        .with_state(uptime_monitor);
+
+    // ── Real-time dashboards (#602) ──────────────────────────────────────
+    let realtime_dashboard = RealtimeDashboard::new();
+    let realtime_router = Router::new()
+        .route("/dashboard/metrics", post(ingest_metric))
+        .route("/dashboard/metrics/:name", get(drill_down_metric))
+        .route("/dashboard/snapshot", get(get_dashboard_snapshot))
+        .route("/dashboard/stream", get(stream_metrics))
+        .route("/dashboard/alerts", post(add_metric_alert_rule))
+        .with_state(realtime_dashboard);
+
     let app = build_router(state)
+        .merge(build_operational_router())
         // .merge(acl_router)
-        // .merge(custom_metrics_router)
+        .merge(custom_metrics_router)
         .merge(anomaly_router)
         .merge(aml_router)
-        // .merge(log_router)
-        .merge(webauthn_router);
+        .merge(log_router)
+        .merge(webauthn_router)
+        .merge(cost_router)
+        .merge(dr_router)
+        .merge(sla_router)
+        .merge(uptime_router)
+        .merge(realtime_router);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }

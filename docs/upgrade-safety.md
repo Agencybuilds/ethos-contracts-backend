@@ -1,11 +1,10 @@
 # Upgrade Safety
 
-`contracts/ttl_vault/src/lib.rs` exposes `upgrade(env, new_wasm_hash)`,
-which lets the admin replace the deployed WASM with arbitrary new code.
-Historically this only checked that the hash was non-zero — it did not
-verify the new code was interface-compatible, storage-compatible, or
-error-code-compatible with the running contract. This document describes
-the compatibility checks that were added and how to use them.
+The hash-only `upgrade(env, new_wasm_hash)` entry point is disabled and
+returns `UpgradeManifestRequired`. All upgrades must use a manifest-aware
+entry point so the candidate is checked against the recorded interface,
+storage, and error-code baseline. This document describes those checks and
+how to use them.
 
 ## What is checked
 
@@ -20,50 +19,95 @@ the new WASM on-chain:
 | `error_code_count` | The new contract having fewer `ContractError` variants than the running one (error codes being removed or renumbered, which silently changes the meaning of an error an integrator is already handling). |
 | `storage_schema_hash` | The new contract no longer reading/writing a storage key the running contract uses (a backward-incompatible storage migration). |
 
+For strict interface validation, use the `*_with_signatures` entry points.
+These store `function_signatures_hash` separately from `UpgradeManifest`.
+Compute it from the sorted public function names and their argument and return
+types in the candidate WASM contract spec. The fingerprint must remain
+identical across an upgrade; merely retaining the same number of exports is
+not sufficient to preserve function compatibility.
+
 `validate_upgrade_compatibility` panics with a specific error
 (`UpgradeInterfaceShrunk`, `UpgradeErrorCodesReduced`,
-`UpgradeStorageSchemaChanged`, `UpgradeManifestNotSet`) when a proposed
-upgrade fails one of these checks.
+`UpgradeStorageSchemaChanged`, `UpgradeManifestNotSet`). The signature-aware
+validator also reports `UpgradeFunctionSignaturesChanged` for a fingerprint
+mismatch and `UpgradeFunctionSignaturesNotSet` when no strict baseline has
+been recorded.
 
 ## Admin workflow
 
 1. **After first deploying/initializing the contract**, record a baseline:
 
    ```
-   set_upgrade_manifest(exported_fn_count, error_code_count, storage_schema_hash)
+   set_upgrade_manifest_signed(
+       exported_fn_count,
+       error_code_count,
+       storage_schema_hash,
+       function_signatures_hash,
+   )
    ```
 
-   Compute these three values with an off-chain tool that inspects the
+   Compute these values with an off-chain tool that inspects the
    deployed WASM (e.g. `wasm-objdump -x` for the export table count, a
    count of `ContractError` variants from the source, and a hash — e.g.
    SHA-256 — over the sorted list of `DataKey` variant names/tags used by
-   the contract).
+   the contract and another over the sorted contract-spec function signatures).
 
-2. **Before every upgrade**, compute the same three values for the *new*
+2. **Before every upgrade**, compute the same manifest values for the *new*
    candidate WASM and call:
 
    ```
-   validate_upgrade_compatibility(new_exported_fn_count, new_error_code_count, new_storage_schema_hash)
+   validate_upgrade_signed(
+       new_exported_fn_count,
+       new_error_code_count,
+       new_storage_schema_hash,
+       new_function_signatures_hash,
+   )
    ```
 
    This can be simulated read-only before submitting the real upgrade
    transaction, to fail fast without spending an upgrade attempt.
 
-3. **Perform the upgrade** with the same three values via:
+3. **Propose the upgrade** with the same manifest values via:
 
    ```
-   upgrade_with_manifest(new_wasm_hash, new_exported_fn_count, new_error_code_count, new_storage_schema_hash)
+   propose_signed_upgrade(
+       new_wasm_hash,
+       new_exported_fn_count,
+       new_error_code_count,
+       new_storage_schema_hash,
+       new_function_signatures_hash,
+   )
    ```
 
-   This validates the hash (`validate_upgrade`), validates compatibility
-   (`validate_upgrade_compatibility`), performs the WASM swap, and then
-   records the new values as the baseline for the *next* upgrade
-   (incrementing `UpgradeManifest.version`).
+   This validates the hash and compatibility and records the candidate as a
+   pending upgrade. The legacy `propose_legacy_signed_upgrade` entry
+   point does the same for existing clients; neither entry point performs the
+   WASM swap immediately.
 
-The legacy `upgrade(new_wasm_hash)` entry point still exists for
-compatibility with existing tooling, but only performs the non-zero-hash
-check — it does not consult the manifest. New deployments and operational
-tooling should prefer `upgrade_with_manifest`.
+4. **Wait 24 hours**, then call `execute_upgrade()`. It revalidates the
+   proposal against the current baseline, performs the WASM swap, and records
+   the candidate values as the baseline for the next upgrade (incrementing
+   `UpgradeManifest.version`). The hash-only `upgrade(new_wasm_hash)` entry
+   point is disabled and cannot bypass the compatibility checks or timelock.
+
+The legacy `set_upgrade_manifest`, `validate_upgrade_compatibility`,
+`upgrade_with_manifest`, and `propose_legacy_signed_upgrade` entry
+points remain available for compatibility with existing tooling. The
+manifest-aware legacy path does not check exact function signatures; new
+deployments and operational tooling should prefer its `*_with_signatures`
+counterpart. Both manifest-aware upgrade variants now only create a proposal;
+`execute_upgrade()` is the only path that installs the new WASM.
+
+## Automated simulation
+
+CI builds the deployable WASM, installs it in a Soroban test environment,
+initializes the contract, and executes the signature-aware upgrade path against
+the candidate artifact. It then verifies the manifest version and stored
+configuration remain accessible after the executable is replaced. Native
+tests also reject changed function-signature fingerprints even when the export
+count is unchanged. To run the WASM simulation locally, build the contract and
+set `TTL_VAULT_WASM_PATH` to `target/wasm32-unknown-unknown/release/ttl_vault.wasm`
+when running the ignored `upgrade_simulation_tests` test.
 
 ## Limitations
 
@@ -77,13 +121,16 @@ tooling should prefer `upgrade_with_manifest`.
   change the hash. Removing or renaming a variant, however, should.
 - If an admin key is compromised, these checks do not prevent a malicious
   upgrade — an attacker with admin authority can compute a manifest for
-  their own malicious contract and pass it in. Admin key security (e.g.
-  the timelocked admin transfer flow already in this contract) remains the
-  primary control. See `docs/runbook-alerts.md#ethoscontractupgradeinprogress`
-  for the operational response when an unexpected upgrade is observed.
+  their own malicious contract and pass it in. The 24-hour upgrade timelock
+  provides a window to detect and respond to a malicious proposal, but admin
+  key security remains essential. See
+  `docs/runbook-alerts.md#ethoscontractupgradeinprogress` for the operational
+  response when an unexpected upgrade is observed.
 
 ## Tests
 
 See `contracts/ttl_vault/src/upgrade_validation_tests.rs` for coverage of:
 missing manifest, interface shrinkage, error code reduction, storage
-schema drift, compatible upgrades, and manifest version incrementing.
+schema drift, signature changes, compatible upgrades, and manifest version
+incrementing. The WASM-level state-preservation test is in
+`contracts/ttl_vault/src/upgrade_simulation_tests.rs`.
