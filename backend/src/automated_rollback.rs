@@ -37,8 +37,23 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
+use prometheus::{register_int_counter, IntCounter};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+// ── Metrics ───────────────────────────────────────────────────────────────────
+
+/// Total number of deployment rollbacks (automated and manual).
+///
+/// Backs the `EthosDeploymentAutoRolledBack` alert rule in `alert_rules.yml`.
+pub static DEPLOYMENT_ROLLBACKS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "ethos_protocol_deployment_rollbacks_total",
+        "Total number of deployment rollbacks (automated or manual)"
+    )
+    .expect("failed to register ethos_protocol_deployment_rollbacks_total")
+});
 
 // ── Domain types ──────────────────────────────────────────────────────────────
 
@@ -150,6 +165,71 @@ impl RollbackPlan {
             description: description.into(),
         });
         self.updated_at = Utc::now();
+    }
+
+    fn is_rolled_back(&self) -> bool {
+        matches!(
+            self.status,
+            RollbackPlanStatus::RolledBack | RollbackPlanStatus::ManualRollback
+        )
+    }
+
+    /// Mark the plan as rolled back and build the history record for it.
+    ///
+    /// Returns an error instead of rolling back twice, so callers must decide
+    /// how to surface a rollback that did not happen.
+    #[must_use = "a rollback that is not recorded leaves no audit trail"]
+    pub fn execute_rollback(
+        &mut self,
+        reason: RollbackReason,
+        reason_detail: String,
+        test_results: Vec<TestResult>,
+    ) -> Result<RollbackRecord, RollbackError> {
+        if self.is_rolled_back() {
+            return Err(RollbackError::AlreadyRolledBack(self.status));
+        }
+
+        self.status = match reason {
+            RollbackReason::OperatorRequest | RollbackReason::ManualOverride => {
+                RollbackPlanStatus::ManualRollback
+            }
+            _ => RollbackPlanStatus::RolledBack,
+        };
+
+        Ok(RollbackRecord {
+            id: Uuid::new_v4().to_string(),
+            plan_id: self.id.clone(),
+            deployment_id: self.deployment_id.clone(),
+            service: self.service.clone(),
+            rolled_back_version: self.version.clone(),
+            previous_version: self.previous_version.clone(),
+            reason,
+            reason_detail,
+            test_results,
+            rolled_back_at: Utc::now(),
+            alert_sent: true,
+        })
+    }
+}
+
+/// Why a rollback could not be executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RollbackError {
+    #[error("plan has already been rolled back")]
+    AlreadyRolledBack(RollbackPlanStatus),
+}
+
+impl RollbackError {
+    fn to_http_error(self) -> (StatusCode, Json<serde_json::Value>) {
+        match self {
+            Self::AlreadyRolledBack(status) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": self.to_string(),
+                    "status": status,
+                })),
+            ),
+        }
     }
 }
 
@@ -410,16 +490,8 @@ pub async fn run_post_deployment_tests(
         .get_mut(&id)
         .ok_or((StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "plan not found" }))))?;
 
-    if plan.status == RollbackPlanStatus::RolledBack
-        || plan.status == RollbackPlanStatus::ManualRollback
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "plan has already been rolled back",
-                "status": plan.status,
-            })),
-        ));
+    if plan.is_rolled_back() {
+        return Err(RollbackError::AlreadyRolledBack(plan.status).to_http_error());
     }
 
     plan.status = RollbackPlanStatus::Testing;
@@ -444,7 +516,13 @@ pub async fn run_post_deployment_tests(
             failed_names.join(", ")
         );
 
-        plan.status = RollbackPlanStatus::RolledBack;
+        let record = plan
+            .execute_rollback(
+                RollbackReason::PostDeploymentTestFailure,
+                reason_detail.clone(),
+                results.clone(),
+            )
+            .map_err(RollbackError::to_http_error)?;
         plan.push_event(format!("automated rollback triggered: {reason_detail}"));
 
         let record = RollbackRecord {
@@ -460,6 +538,8 @@ pub async fn run_post_deployment_tests(
             rolled_back_at: Utc::now(),
             alert_sent: true,
         };
+
+        DEPLOYMENT_ROLLBACKS_TOTAL.inc();
 
         tracing::error!(
             plan_id = %plan.id,
@@ -523,12 +603,17 @@ pub async fn trigger_rollback(
     State(state): State<Arc<RollbackState>>,
     Path(id): Path<String>,
     Json(body): Json<ManualRollbackRequest>,
-) -> Result<Json<RollbackPlan>, StatusCode> {
+) -> Result<Json<RollbackPlan>, (StatusCode, Json<serde_json::Value>)> {
     let mut guard = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let store = &mut *guard;
-    let plan = store.plans.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let plan = store
+        .plans
+        .get_mut(&id)
+        .ok_or((StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "plan not found" }))))?;
 
-    plan.status = RollbackPlanStatus::ManualRollback;
+    let record = plan
+        .execute_rollback(RollbackReason::OperatorRequest, body.reason_detail.clone(), vec![])
+        .map_err(RollbackError::to_http_error)?;
     plan.push_event(format!("manual rollback triggered: {}", body.reason_detail));
 
     let record = RollbackRecord {
@@ -544,6 +629,8 @@ pub async fn trigger_rollback(
         rolled_back_at: Utc::now(),
         alert_sent: true,
     };
+
+    DEPLOYMENT_ROLLBACKS_TOTAL.inc();
 
     tracing::warn!(
         plan_id = %plan.id,
@@ -715,8 +802,8 @@ mod tests {
 
         // Verify history record was stored.
         let Json(history) = list_rollback_history(State(Arc::clone(&state))).await;
-        assert!(!history.is_empty());
-        assert_eq!(history[0].reason, RollbackReason::PostDeploymentTestFailure);
+        let first = history.first().expect("expected a rollback history record");
+        assert_eq!(first.reason, RollbackReason::PostDeploymentTestFailure);
     }
 
     #[tokio::test]
@@ -763,8 +850,9 @@ mod tests {
         assert_eq!(updated.status, RollbackPlanStatus::ManualRollback);
 
         let Json(history) = list_rollback_history(State(Arc::clone(&state))).await;
-        assert_eq!(history[0].reason, RollbackReason::OperatorRequest);
-        assert!(history[0].reason_detail.contains("memory leak"));
+        let first = history.first().expect("expected a rollback history record");
+        assert_eq!(first.reason, RollbackReason::OperatorRequest);
+        assert!(first.reason_detail.contains("memory leak"));
     }
 
     #[tokio::test]

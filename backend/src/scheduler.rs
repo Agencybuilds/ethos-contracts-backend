@@ -29,6 +29,9 @@ pub async fn run(db: Arc<Db>) {
     // Seed default secret rotation policies on startup.
     crate::secret_rotation::seed_default_policies(&db);
 
+    let materialized_views =
+        crate::materialized_views::MaterializedViewManager::new(Arc::clone(&db));
+
     let mut interval = tokio::time::interval(Duration::from_mins(1));
     // Track when we last ran the daily/hourly tasks.
     let mut last_daily_purge = chrono::DateTime::<Utc>::MIN_UTC;
@@ -131,6 +134,19 @@ pub async fn run(db: Arc<Db>) {
             run_encryption_backfill_job().await;
             last_encryption_backfill = now;
         }
+
+        // 6) Materialized view refresh. Each view tracks its own interval;
+        //    refresh errors are returned here rather than swallowed so they
+        //    are visible in logs, and failed views are retried next tick.
+        if let Err(e) = materialized_views.refresh_due_views() {
+            for failure in &e.failures {
+                tracing::error!(
+                    view = failure.view,
+                    error = %failure.source,
+                    "materialized view refresh failed"
+                );
+            }
+        }
     }
 }
 
@@ -159,10 +175,16 @@ async fn run_encryption_backfill_job() {
         }
     };
 
-    let placeholder_records: Vec<crate::encryption::BackfillRecord> = vec![];
+    // No loader for stored plaintext rows is wired yet. Running over an empty
+    // list would report a finished backfill that changed nothing (#888).
+    let records: Vec<crate::encryption::BackfillRecord> = Vec::new();
+    if records.is_empty() {
+        tracing::warn!("encryption_backfill: no record source is configured, backfill not run");
+        return;
+    }
     let summary = crate::encryption::run_backfill(
         &engine,
-        &placeholder_records,
+        &records,
         BackfillCursor::default(),
         /* batch_size */ 200,
         Duration::from_secs(1),
@@ -173,9 +195,19 @@ async fn run_encryption_backfill_job() {
                 failed = batch.failed.len(),
                 "encryption_backfill: batch processed"
             );
+            // No records are persisted yet (see doc comment above).
+            Ok::<(), std::convert::Infallible>(())
         },
     )
     .await;
+
+    if let Some(error) = &summary.persist_error {
+        tracing::error!(
+            %error,
+            cursor = summary.final_cursor.offset,
+            "encryption_backfill: failed to persist batch; will resume from cursor"
+        );
+    }
 
     tracing::info!(
         updated = summary.total_updated,
@@ -275,10 +307,14 @@ fn run_backup_validation_job() {
         "backup validation job started"
     );
 
-    // Simulate validating a placeholder backup so the code path is exercised.
-    // Replace with real backup retrieval when storage integration is ready.
-    let placeholder_backups: Vec<(String, Vec<u8>)> = vec![];
-    let results = BackupValidator::validate_all_backups(&placeholder_backups);
+    // No backup storage is wired yet. An empty list must not report a passed
+    // validation, so the job fails here (#889).
+    let backups: Vec<(String, Vec<u8>)> = Vec::new();
+    if backups.is_empty() {
+        tracing::error!(job_id = %job_id, "backup validation failed: no backups found");
+        return;
+    }
+    let results = BackupValidator::validate_all_backups(&backups);
 
     for result in &results {
         if result.valid {
