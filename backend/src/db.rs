@@ -675,6 +675,28 @@ impl Db {
 use crate::db_read_pool::{open_writer, resolve_target, ReadGuard, ReadPool};
 use rusqlite::{params, Connection, OptionalExtension};
 
+/// Serialize `value` to JSON for storage in a TEXT column, surfacing failures
+/// as a `rusqlite::Error` instead of panicking the request task.
+fn to_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, rusqlite::Error> {
+    serde_json::to_string(value)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+}
+
+/// Deserialize a JSON TEXT column read from row index `column`, surfacing
+/// corrupt data as a `rusqlite::Error` instead of panicking.
+fn from_json_column<T: serde::de::DeserializeOwned>(
+    raw: &str,
+    column: usize,
+) -> Result<T, rusqlite::Error> {
+    serde_json::from_str(raw).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(e),
+        )
+    })
+}
+
 fn vault_status_to_str(status: &crate::models::VaultStatus) -> &'static str {
     match status {
         crate::models::VaultStatus::Active => "active",
@@ -959,7 +981,7 @@ impl Db {
     pub fn reset_captcha_events(&self, ip: &str) -> Result<(), rusqlite::Error> {
         self.conn
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .execute("DELETE FROM captcha_ip_events WHERE ip = ?1", params![ip])?;
         Ok(())
     }
@@ -1665,10 +1687,10 @@ impl Db {
                  WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%' \
                  ORDER BY name",
             )
-            .unwrap();
+            .expect("prepare sqlite_master query");
         stmt.query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .map(Result::unwrap)
+            .expect("query sqlite_master")
+            .map(|r| r.expect("read schema object name"))
             .collect()
     }
 
@@ -1680,17 +1702,17 @@ impl Db {
         let conn = self.reader();
         let mut stmt = conn
             .prepare(&format!("PRAGMA table_info({table})"))
-            .unwrap();
+            .expect("prepare table_info pragma");
         stmt.query_map([], |row| {
             Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
         })
-        .unwrap()
-        .map(Result::unwrap)
+        .expect("query table_info pragma")
+        .map(|r| r.expect("read table_info row"))
         .collect()
     }
 
     pub fn upsert(&self, prefs: &ReminderPreferences) -> Result<(), rusqlite::Error> {
-        let channels_json = serde_json::to_string(&prefs.channels).unwrap();
+        let channels_json = to_json(&prefs.channels)?;
         self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"
             INSERT INTO reminder_preferences (vault_id, channels, hours_before_expiry, frequency)
@@ -1705,7 +1727,7 @@ impl Db {
                 prefs.vault_id.cast_signed(),
                 channels_json,
                 prefs.hours_before_expiry as i64,
-                serde_json::to_string(&prefs.frequency).unwrap(),
+                to_json(&prefs.frequency)?,
             ],
         )?;
         Ok(())
@@ -1722,7 +1744,7 @@ impl Db {
                 let channels_str: String = r.get(1)?;
                 let frequency_str: String = r.get(3)?;
                 let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
-                let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+                let frequency: Frequency = from_json_column(&frequency_str, 3)?;
                 Ok(ReminderPreferences {
                     vault_id: r.get::<_, i64>(0)? as u64,
                     channels,
@@ -1761,7 +1783,7 @@ impl Db {
                 let channels_str: String = r.get(1)?;
                 let frequency_str: String = r.get(3)?;
                 let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
-                let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+                let frequency: Frequency = from_json_column(&frequency_str, 3)?;
                 Ok(ReminderPreferences {
                     vault_id: r.get::<_, i64>(0)? as u64,
                     channels,
@@ -1801,7 +1823,7 @@ impl Db {
                 let channels_str: String = r.get(1)?;
                 let frequency_str: String = r.get(3)?;
                 let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
-                let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+                let frequency: Frequency = from_json_column(&frequency_str, 3)?;
                 let deleted_at_str: Option<String> = r.get(4)?;
                 let deleted_at = deleted_at_str.and_then(|s| {
                     chrono::DateTime::parse_from_rfc3339(&s)
@@ -1826,8 +1848,8 @@ impl Db {
     }
 
     pub fn upsert_subscription(&self, sub: &Subscription) -> Result<(), rusqlite::Error> {
-        let channels_json = serde_json::to_string(&sub.channels).unwrap();
-        let frequency_json = serde_json::to_string(&sub.frequency).unwrap();
+        let channels_json = to_json(&sub.channels)?;
+        let frequency_json = to_json(&sub.frequency)?;
         self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"
             INSERT INTO vault_subscriptions (vault_id, owner, channels, frequency)
@@ -1867,7 +1889,7 @@ impl Db {
             let frequency_str: String = r.get(3)?;
             let channels: Vec<SubscriptionChannel> =
                 serde_json::from_str(&channels_str).unwrap_or_default();
-            let frequency: SubscriptionFrequency = serde_json::from_str(&frequency_str).unwrap();
+            let frequency: SubscriptionFrequency = from_json_column(&frequency_str, 3)?;
             Ok(Subscription {
                 vault_id: r.get::<_, i64>(0)? as u64,
                 owner: r.get(1)?,
@@ -1981,8 +2003,8 @@ impl Db {
     pub fn upsert_2fa_config(&self, config: &TwoFactorConfig) -> Result<(), rusqlite::Error> {
         let enabled_i = i64::from(config.enabled);
         let verified_at = config.verified_at.map(|d| d.to_rfc3339());
-        let method_str = serde_json::to_string(&config.method).unwrap();
-        let backup_codes_json = serde_json::to_string(&config.backup_codes).unwrap();
+        let method_str = to_json(&config.method)?;
+        let backup_codes_json = to_json(&config.backup_codes)?;
 
         self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"
@@ -2992,8 +3014,8 @@ impl Db {
         &self,
         policy: &crate::models::SecretRotationPolicy,
     ) -> Result<(), rusqlite::Error> {
-        let secret_type = serde_json::to_string(&policy.secret_type).unwrap();
-        let channels_json = serde_json::to_string(&policy.notify_channels).unwrap();
+        let secret_type = to_json(&policy.secret_type)?;
+        let channels_json = to_json(&policy.notify_channels)?;
         self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO secret_rotation_policies
                 (secret_type, rotation_interval_days, grace_period_hours, max_token_lifetime_hours,
@@ -3025,7 +3047,7 @@ impl Db {
         &self,
         secret_type: &crate::models::SecretType,
     ) -> Result<Option<crate::models::SecretRotationPolicy>, rusqlite::Error> {
-        let secret_type_str = serde_json::to_string(secret_type).unwrap();
+        let secret_type_str = to_json(secret_type)?;
         let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
@@ -3094,7 +3116,7 @@ impl Db {
         &self,
         log: &crate::models::SecretRotationLog,
     ) -> Result<(), rusqlite::Error> {
-        let secret_type_str = serde_json::to_string(&log.secret_type).unwrap();
+        let secret_type_str = to_json(&log.secret_type)?;
         self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO secret_rotation_logs
                 (secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes)
@@ -3116,7 +3138,7 @@ impl Db {
         &self,
         secret_type: &crate::models::SecretType,
     ) -> Result<Option<crate::models::SecretRotationLog>, rusqlite::Error> {
-        let secret_type_str = serde_json::to_string(secret_type).unwrap();
+        let secret_type_str = to_json(secret_type)?;
         let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT id, secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes
@@ -3136,7 +3158,7 @@ impl Db {
         secret_type: &crate::models::SecretType,
         limit: u32,
     ) -> Result<Vec<crate::models::SecretRotationLog>, rusqlite::Error> {
-        let secret_type_str = serde_json::to_string(secret_type).unwrap();
+        let secret_type_str = to_json(secret_type)?;
         let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT id, secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes
@@ -3265,7 +3287,7 @@ impl Db {
             ",
             rusqlite::params![
                 &status.name,
-                serde_json::to_string(&status.level).unwrap(),
+                to_json(&status.level)?,
                 &status.reason,
                 status.fallback_available as i32,
                 status.updated_at.to_rfc3339(),
@@ -3871,7 +3893,7 @@ mod tests {
             "ethos_vault_restart_{}.sqlite3",
             uuid::Uuid::new_v4()
         ));
-        let path_str = path.to_str().unwrap();
+        let path_str = path.to_str().expect("path should be valid UTF-8");
         let vault = make_test_vault("restart-vault");
 
         {
@@ -3881,8 +3903,8 @@ mod tests {
         }
 
         // Re-open against the same file, simulating a process restart.
-        let db = Db::open(path_str).unwrap();
-        db.migrate().unwrap();
+        let db = Db::open(path_str).expect("Db::open should succeed");
+        db.migrate().expect("migrate should succeed");
         let reloaded = db
             .get_vault(&vault.id)
             .expect("vault should survive db restart");
@@ -3901,14 +3923,14 @@ mod tests {
             "ethos_vault_multi_{}.sqlite3",
             uuid::Uuid::new_v4()
         ));
-        let path_str = path.to_str().unwrap();
+        let path_str = path.to_str().expect("path should be valid UTF-8");
 
         // Two independent `Db` handles on the same file, simulating two
         // instances sharing a database behind a load balancer.
-        let db_a = Db::open(path_str).unwrap();
-        db_a.migrate().unwrap();
-        let db_b = Db::open(path_str).unwrap();
-        db_b.migrate().unwrap();
+        let db_a = Db::open(path_str).expect("Db::open should succeed");
+        db_a.migrate().expect("migrate should succeed");
+        let db_b = Db::open(path_str).expect("Db::open should succeed");
+        db_b.migrate().expect("migrate should succeed");
 
         let vault = make_test_vault("shared-vault");
         db_a.insert_vault(vault.clone()).unwrap();
@@ -3974,9 +3996,12 @@ mod tests {
 
     #[test]
     fn resolve_db_path_defaults_to_mounted_volume_file() {
-        assert_eq!(resolve_db_path(None, false).unwrap(), DEFAULT_DB_PATH);
         assert_eq!(
-            resolve_db_path(Some("   "), false).unwrap(),
+            resolve_db_path(None, false).expect("resolve_db_path should succeed"),
+            DEFAULT_DB_PATH
+        );
+        assert_eq!(
+            resolve_db_path(Some("   "), false).expect("resolve_db_path should succeed"),
             DEFAULT_DB_PATH
         );
     }
@@ -3984,7 +4009,8 @@ mod tests {
     #[test]
     fn resolve_db_path_uses_configured_file() {
         assert_eq!(
-            resolve_db_path(Some(" /data/ethos.db "), false).unwrap(),
+            resolve_db_path(Some(" /data/ethos.db "), false)
+                .expect("resolve_db_path should succeed"),
             "/data/ethos.db"
         );
     }
@@ -4001,7 +4027,7 @@ mod tests {
     #[test]
     fn resolve_db_path_allows_memory_with_explicit_opt_in() {
         assert_eq!(
-            resolve_db_path(Some(":memory:"), true).unwrap(),
+            resolve_db_path(Some(":memory:"), true).expect("resolve_db_path should succeed"),
             EPHEMERAL_DB_PATH
         );
     }
@@ -4012,8 +4038,12 @@ mod tests {
         // startup pool config, then reopen the same file after a "restart".
         let dir = std::env::temp_dir().join(format!("ethos_db_startup_{}", uuid::Uuid::new_v4()));
         let file = dir.join("ethos-protocol.db");
-        let path = resolve_db_path(Some(file.to_str().unwrap()), false).unwrap();
-        std::fs::create_dir_all(&dir).unwrap();
+        let path = resolve_db_path(
+            Some(file.to_str().expect("path should be valid UTF-8")),
+            false,
+        )
+        .expect("resolve_db_path should succeed");
+        std::fs::create_dir_all(&dir).expect("create_dir_all should succeed");
 
         let vault = make_test_vault("startup-path-vault");
         {
@@ -4022,8 +4052,9 @@ mod tests {
             db.insert_vault(vault.clone()).unwrap();
         }
 
-        let db = Db::open_with_pool_config(&path, &PoolConfig::default()).unwrap();
-        db.migrate().unwrap();
+        let db = Db::open_with_pool_config(&path, &PoolConfig::default())
+            .expect("Db::open_with_pool_config should succeed");
+        db.migrate().expect("migrate should succeed");
         let reloaded = db
             .get_vault(&vault.id)
             .expect("vault should be readable after restart");
@@ -4031,7 +4062,7 @@ mod tests {
         assert_eq!(reloaded.balance, vault.balance);
 
         drop(db);
-        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).expect("remove_dir_all should succeed");
     }
 
     #[test]
@@ -4040,18 +4071,34 @@ mod tests {
             "ethos_captcha_events_{}.sqlite3",
             uuid::Uuid::new_v4()
         ));
-        let path_str = path.to_str().unwrap();
-        let db_a = Db::open(path_str).unwrap();
-        db_a.migrate().unwrap();
-        let db_b = Db::open(path_str).unwrap();
-        db_b.migrate().unwrap();
+        let path_str = path.to_str().expect("path should be valid UTF-8");
+        let db_a = Db::open(path_str).expect("Db::open should succeed");
+        db_a.migrate().expect("migrate should succeed");
+        let db_b = Db::open(path_str).expect("Db::open should succeed");
+        db_b.migrate().expect("migrate should succeed");
 
-        assert_eq!(db_a.record_captcha_event("192.0.2.80", 300).unwrap(), 1);
-        assert_eq!(db_a.record_captcha_event("192.0.2.80", 300).unwrap(), 2);
-        assert_eq!(db_b.captcha_event_count("192.0.2.80", 300).unwrap(), 2);
+        assert_eq!(
+            db_a.record_captcha_event("192.0.2.80", 300)
+                .expect("record_captcha_event should succeed"),
+            1
+        );
+        assert_eq!(
+            db_a.record_captcha_event("192.0.2.80", 300)
+                .expect("record_captcha_event should succeed"),
+            2
+        );
+        assert_eq!(
+            db_b.captcha_event_count("192.0.2.80", 300)
+                .expect("captcha_event_count should succeed"),
+            2
+        );
 
-        db_b.reset_captcha_events("192.0.2.80").unwrap();
-        assert_eq!(db_a.captcha_event_count("192.0.2.80", 300).unwrap(), 0);
+        db_b.reset_captcha_events("192.0.2.80").expect("reset_captcha_events should succeed");
+        assert_eq!(
+            db_a.captcha_event_count("192.0.2.80", 300)
+                .expect("captcha_event_count should succeed"),
+            0
+        );
 
         drop(db_a);
         drop(db_b);
@@ -4068,12 +4115,12 @@ mod tests {
             "ethos_replica_copy_{}.sqlite3",
             uuid::Uuid::new_v4()
         ));
-        let primary_path_str = primary_path.to_str().unwrap();
-        let replica_path_str = replica_path.to_str().unwrap();
-        let primary = Db::open(primary_path_str).unwrap();
-        primary.migrate().unwrap();
-        let replica = Db::open(replica_path_str).unwrap();
-        replica.migrate().unwrap();
+        let primary_path_str = primary_path.to_str().expect("path should be valid UTF-8");
+        let replica_path_str = replica_path.to_str().expect("path should be valid UTF-8");
+        let primary = Db::open(primary_path_str).expect("Db::open should succeed");
+        primary.migrate().expect("migrate should succeed");
+        let replica = Db::open(replica_path_str).expect("Db::open should succeed");
+        replica.migrate().expect("migrate should succeed");
 
         primary
             .upsert(&ReminderPreferences {
@@ -4083,7 +4130,7 @@ mod tests {
                 frequency: Frequency::Daily,
                 deleted_at: None,
             })
-            .unwrap();
+            .expect("upsert should succeed");
         replica
             .upsert(&ReminderPreferences {
                 vault_id: 1,
@@ -4092,7 +4139,7 @@ mod tests {
                 frequency: Frequency::Daily,
                 deleted_at: None,
             })
-            .unwrap();
+            .expect("upsert should succeed");
 
         let routed = Db::open_with_read_replicas(
             primary_path_str,
@@ -4101,12 +4148,18 @@ mod tests {
             crate::read_replica::ReplicaRoutingStrategy::RoundRobin,
             500,
         )
-        .unwrap();
-        assert_eq!(routed.get(1).unwrap().channels, vec![Channel::Sms]);
+        .expect("Db::open_with_read_replicas should succeed");
+        assert_eq!(
+            routed
+                .get(1)
+                .expect("routed preferences should exist")
+                .channels,
+            vec![Channel::Sms]
+        );
         assert_eq!(
             routed
                 .read_replica_router()
-                .unwrap()
+                .expect("read replica router should be configured")
                 .all_metrics()[1]
                 .total_reads,
             1
@@ -4114,9 +4167,15 @@ mod tests {
 
         routed
             .read_replica_router()
-            .unwrap()
+            .expect("read replica router should be configured")
             .mark_unreachable(replica_path_str);
-        assert_eq!(routed.get(1).unwrap().channels, vec![Channel::Email]);
+        assert_eq!(
+            routed
+                .get(1)
+                .expect("routed preferences should exist")
+                .channels,
+            vec![Channel::Email]
+        );
 
         drop(routed);
         drop(replica);
