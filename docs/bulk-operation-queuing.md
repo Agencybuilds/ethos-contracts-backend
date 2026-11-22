@@ -22,7 +22,7 @@ Client Request (POST /jobs)
               • Mark status: completed/failed
 ```
 
-Jobs are stored in an in-memory `JobStore` (`Arc<Mutex<HashMap<String, BulkJob>>>`). For production, replace with a persistent queue (PostgreSQL, Redis, or RabbitMQ).
+Jobs and each status/progress update are stored in SQLite before being acknowledged. The database path is configured with `JOB_QUEUE_DB_PATH` (default: `jobs.sqlite3`). On startup, jobs left in `running` are returned to `queued` and dispatched again; jobs already queued are also resumed.
 
 ## Endpoints
 

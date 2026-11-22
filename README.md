@@ -328,5 +328,5 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 <!-- handsoff-issue-596 -->
 - #596: Add Infrastructure as Code (IaC)
 
-<!-- handsoff-issue-862 -->
-- #862: Vault Shares and Share Tokens Live Only in Memory
+<!-- handsoff-issue-783 -->
+- #783: `get_delegation_history` Is Unbounded and Unpaginated
