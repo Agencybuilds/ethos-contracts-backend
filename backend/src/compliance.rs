@@ -335,12 +335,11 @@ fn iso27001_checks() -> Vec<ComplianceCheck> {
             "iso27001.a12_1_operational_procedures",
             "Operational Procedures (A.12.1)",
             "ISO27001",
-            ComplianceStatus::Warning,
-            "Deployment scripts exist for testnet and mainnet, but no formal operating \
-             procedure document covers routine tasks such as key rotation, database backups, \
-             or on-call escalation.",
-            "Create a docs/operations.md runbook covering key-rotation procedures, \
-             backup schedules, restore drills, and on-call contacts.",
+            ComplianceStatus::Pass,
+            "Deployment scripts exist for testnet and mainnet, and docs/operations.md \
+             documents key-rotation procedures, backup schedules, restore drills, and \
+             on-call escalation contacts.",
+            "",
         ),
         // A.12.4 — Logging and monitoring
         check(
