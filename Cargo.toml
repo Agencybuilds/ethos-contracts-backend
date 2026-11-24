@@ -5,6 +5,8 @@ members = [
     "contracts/zk_verifier",
     "contracts/sbt",
     "backend",
+]
+exclude = [
     "contracts/insurance_pool",
     "crates/metric-retention",
     "crates/synthetic-monitor",
