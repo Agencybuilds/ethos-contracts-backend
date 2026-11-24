@@ -9,9 +9,10 @@
 //! * [`openapi_validation_middleware`] — an Axum middleware that checks every
 //!   incoming request against the spec and rejects method mismatches on
 //!   declared paths with `405 Method Not Allowed`.
-//! * [`OpenApiSpec::declared_operations`] — used by the CI drift check
-//!   (`.github/workflows/openapi-drift.yml`) to fail the build when the spec
-//!   and the router disagree.
+//! * [`OpenApiSpec::declared_operations`] — returns the sorted `(method, path)`
+//!   operations declared in the spec (tested in `.github/workflows/openapi.yml`,
+//!   which also runs `scripts/check_openapi_drift.mjs` to fail the build when
+//!   the spec and the router disagree).
 //!
 //! Full JSON-Schema body validation is intentionally out of scope here (it
 //! would pull in a schema-validation crate); this layer enforces the
