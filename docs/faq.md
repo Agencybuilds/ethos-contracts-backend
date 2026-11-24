@@ -361,7 +361,7 @@ See [docs/push-notifications.md](push-notifications.md) for advanced notificatio
 
 ### What monitoring is available?
 
-Prometheus-compatible metrics are exposed for service health and contract event tracking. See [docs/monitoring-guide.md](monitoring-guide.md).
+Prometheus-compatible metrics are exposed for service health and contract-related metrics. See [docs/monitoring-guide.md](monitoring-guide.md).
 
 ---
 
