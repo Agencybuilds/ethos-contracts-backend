@@ -30,6 +30,7 @@ fi
 if [[ "$CONTRACT_ALREADY_DEPLOYED" == "true" && "$FORCE_DEPLOY" != "true" ]]; then
   echo "✓ Contract already deployed to $NETWORK (${EXISTING_CONTRACT:-see marker}). Skipping deploy step."
   echo "  Use --force to intentionally redeploy."
+  CONTRACT_ID="$EXISTING_CONTRACT"
 else
   # Build first
   run_step ./scripts/build.sh
@@ -56,13 +57,24 @@ else
   mark_step_done "$NETWORK" "contract_deployed"
 fi
 
-# --- Admin initialization guard ---
-# Mirrors mainnet: initialize() itself is idempotent on-chain (panics on
-# AlreadyInitialized), but the local marker avoids the redundant call/attempt
-# entirely on a re-run after a partial failure.
+# --- Admin initialization ---
+# initialize() panics on AlreadyInitialized on-chain, so we only invoke it when
+# the local marker says it has not completed (or on a forced redeploy).
 if step_done "$NETWORK" "admin_initialized" && [[ "$FORCE_DEPLOY" != "true" ]]; then
   echo "✓ Admin state already initialized for $NETWORK. Skipping."
 else
-  echo "✓ Marking admin state as initialized for $NETWORK (initialize() is called separately per the runbook)."
+  ADMIN_ADDRESS=$(stellar keys address "$DEPLOYER")
+  NATIVE_TOKEN_ADDRESS=$(stellar contract id asset --asset native --network "$NETWORK")
+
+  echo "Initializing contract on $NETWORK (admin=$ADMIN_ADDRESS, token=native XLM)..."
+  run_step stellar contract invoke \
+    --id "$CONTRACT_ID" \
+    --source "$DEPLOYER" \
+    --network "$NETWORK" \
+    -- initialize \
+    --admin "$ADMIN_ADDRESS" \
+    --token "$NATIVE_TOKEN_ADDRESS"
+
+  echo "✓ Contract initialized on $NETWORK"
   mark_step_done "$NETWORK" "admin_initialized"
 fi
