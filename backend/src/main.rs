@@ -292,6 +292,17 @@ async fn consensus_health_handler(
     }
 }
 
+#[allow(clippy::unused_async)]
+async fn assetlinks_handler() -> (
+    [(axum::http::header::HeaderName, &'static str); 1],
+    &'static str,
+) {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        include_str!("../.well-known/assetlinks.json"),
+    )
+}
+
 pub fn build_router(state: AppState) -> Router {
     // Note: retry_state, bulkhead_registry, and timeout_state are currently unused
     // pending integration of retry policies, bulkhead isolation, and timeout handling.
@@ -333,6 +344,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/admin/flags/:key/evaluate", post(evaluate_flag_handler))
         .route("/estimate-cost", post(estimate_cost_handler))
         // ── Health ──────────────────────────────────────────────────────────
+        .route("/.well-known/assetlinks.json", get(assetlinks_handler))
         .route("/health", get(health_handler))
         .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
