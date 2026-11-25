@@ -636,7 +636,7 @@ erDiagram
 | **ZK Proofs** | `zk_verifier` contract | On-chain passkey signature verification |
 | **Soulbound Tokens** | `sbt` contract | Non-transferable identity and reputation tokens |
 | **Notifications** | Email + SMS (configurable APIs) | Owner reminders for upcoming check-in deadlines |
-| **Monitoring** | Prometheus-compatible metrics | Service health and contract event tracking |
+| **Monitoring** | Prometheus-compatible metrics | Service health and contract-related metrics |
 | **CI** | GitHub Actions | Automated build, test, and lint on every PR |
 
 ---

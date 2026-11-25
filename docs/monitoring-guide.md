@@ -8,7 +8,6 @@ before users report them.
 ## Architecture
 
 ```
- ttl_vault contract events ──> event indexer ──> /metrics (Prometheus text)
  backend API (metrics.rs, custom_metrics.rs) ──> /metrics (Prometheus text)
                                                         │
                                                         ▼
@@ -38,7 +37,7 @@ The backend exposes metrics in Prometheus text-exposition format via the
 | `ethos_protocol_contract_paused` | metrics.rs | Gauge, 1 if contract is paused |
 | `ethos_protocol_credential_lifecycle_transitions_total` | custom_metrics.rs | Counter of credential lifecycle state transitions |
 | `ethos_protocol_credential_lifecycle_errors_total` | custom_metrics.rs | Counter of failed lifecycle transitions |
-| `ethos_protocol_contract_upgrade_events_total` | event indexer | Counter of on-chain `upgrade()` events observed |
+| `ethos_protocol_contract_upgrade_events_total` | metrics.rs | Counter of on-chain `upgrade()` events observed |
 | `ethos_protocol_http_request_duration_seconds` | custom_metrics.rs | Histogram of API latency |
 
 To start local collection:
@@ -47,9 +46,9 @@ To start local collection:
 prometheus --config.file=monitoring/prometheus.yml
 ```
 
-Set `BACKEND_HOST`, `BACKEND_PORT`, `EVENT_INDEXER_HOST`, `EVENT_INDEXER_PORT`,
-and `DEPLOY_ENV` in the environment before starting Prometheus, or edit the
-static targets directly in `monitoring/prometheus.yml`.
+Set `BACKEND_HOST`, `BACKEND_PORT`, and `DEPLOY_ENV` in the environment before
+starting Prometheus, or edit the static targets directly in
+`monitoring/prometheus.yml`.
 
 ## 2. Grafana dashboards
 

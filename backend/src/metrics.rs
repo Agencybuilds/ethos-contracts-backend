@@ -89,7 +89,7 @@ pub struct Metrics {
     pub request_errors_total: AtomicU64,
     pub http_requests_total: AtomicU64,
     pub contract_paused: AtomicU64,
-    /// Count of on-chain `upgrade()` events observed by the event indexer.
+    /// Count of on-chain `upgrade()` events observed.
     /// Feeds the `EthosContractUpgradeInProgress` alert — see
     /// docs/monitoring-guide.md and monitoring/alert_rules.yml.
     pub contract_upgrade_events_total: AtomicU64,
