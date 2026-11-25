@@ -15,12 +15,22 @@
 //! - SHA256 (default)
 //! - SHA512
 //! - ED25519
+//!
+//! # Nonce Storage (#866)
+//!
+//! Nonces are stored with their timestamp in a shared `NonceStore` backed by
+//! either Redis (multi-instance) or an in-process map (single-process / tests).
+//!
+//! Each entry expires automatically after `MAX_TIMESTAMP_DRIFT_SECS * 2`
+//! seconds, which is the outer bound for a valid nonce. The in-process store
+//! prunes stale entries on every `check_and_insert` call so memory is bounded
+//! even when Redis is unavailable.
 
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Sha512};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 // ── Signature algorithms ──────────────────────────────────────────────────────
@@ -58,18 +68,131 @@ pub struct SignedRequest {
     pub algorithm: Option<String>,
 }
 
-// ── Signature verification ────────────────────────────────────────────────────
+// ── Nonce store ───────────────────────────────────────────────────────────────
+
+/// TTL applied to every stored nonce.
+///
+/// A nonce is valid only within the `MAX_TIMESTAMP_DRIFT_SECS` window on each
+/// side of now, so doubling that drift gives a safe outer bound: even a nonce
+/// signed at the very edge of the allowed window cannot arrive after this TTL.
+pub const NONCE_TTL_SECS: i64 = MAX_TIMESTAMP_DRIFT_SECS * 2;
+
+/// Abstraction over nonce persistence so the verifier works in tests (in-process)
+/// and in production (Redis).
+pub trait NonceStore: Send + Sync {
+    /// Return `true` and record the nonce when it has not been seen before;
+    /// return `false` when it is already present (replay detected).
+    fn check_and_insert(&self, nonce: &str, now_secs: i64) -> bool;
+}
+
+// ── In-process nonce store (single-instance / tests) ─────────────────────────
+
+/// Maps nonce → unix-second timestamp at which it was first seen.
+///
+/// Stale entries (older than `NONCE_TTL_SECS`) are pruned on every call so
+/// memory stays bounded at roughly `request_rate × NONCE_TTL_SECS` entries.
+pub struct InProcessNonceStore {
+    entries: Mutex<HashMap<String, i64>>,
+}
+
+impl InProcessNonceStore {
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for InProcessNonceStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NonceStore for InProcessNonceStore {
+    fn check_and_insert(&self, nonce: &str, now_secs: i64) -> bool {
+        let mut map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Prune expired entries before every check to keep the map bounded.
+        map.retain(|_, &mut recorded_at| now_secs - recorded_at < NONCE_TTL_SECS);
+
+        if map.contains_key(nonce) {
+            return false;
+        }
+        map.insert(nonce.to_owned(), now_secs);
+        true
+    }
+}
+
+// ── Redis nonce store (multi-instance) ───────────────────────────────────────
+
+/// Stores nonces in Redis with a per-key TTL so they expire automatically and
+/// any number of backend instances share the same replay-protection state.
+///
+/// The key format is `nonce:<nonce>`.  `SET NX PX` is atomic, so concurrent
+/// instances cannot both accept the same nonce.
+pub struct RedisNonceStore {
+    client: redis::Client,
+}
+
+impl RedisNonceStore {
+    /// Create a store from a Redis connection URL, e.g. `redis://127.0.0.1/`.
+    pub fn new(redis_url: &str) -> Result<Self, redis::RedisError> {
+        let client = redis::Client::open(redis_url)?;
+        Ok(Self { client })
+    }
+}
+
+impl NonceStore for RedisNonceStore {
+    fn check_and_insert(&self, nonce: &str, _now_secs: i64) -> bool {
+        use redis::Commands;
+        let mut conn = match self.client.get_connection() {
+            Ok(c) => c,
+            // If Redis is unreachable, fail closed (reject the request) to
+            // avoid inadvertently accepting replays during an outage.
+            Err(_) => return false,
+        };
+
+        let key = format!("nonce:{nonce}");
+        let ttl_ms = (NONCE_TTL_SECS * 1000) as u64;
+
+        // SET key 1 NX PX ttl_ms — returns Some("OK") on first use, None when key exists.
+        let result: Option<String> = match conn.set_options(
+            &key,
+            "1",
+            redis::SetOptions::default()
+                .conditional_set(redis::ExistenceCheck::NX)
+                .with_expiration(redis::SetExpiry::PX(ttl_ms)),
+        ) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        result.is_some()
+    }
+}
+
+// ── Signature verifier ────────────────────────────────────────────────────────
 
 pub struct SignatureVerifier {
     public_keys: Arc<Mutex<Vec<String>>>,
-    used_nonces: Arc<Mutex<HashSet<String>>>,
+    nonce_store: Arc<dyn NonceStore>,
 }
 
 impl SignatureVerifier {
+    /// Create a verifier backed by an in-process nonce store.
     pub fn new() -> Self {
         Self {
             public_keys: Arc::new(Mutex::new(Vec::new())),
-            used_nonces: Arc::new(Mutex::new(HashSet::new())),
+            nonce_store: Arc::new(InProcessNonceStore::new()),
+        }
+    }
+
+    /// Create a verifier backed by an arbitrary `NonceStore` (e.g. Redis).
+    pub fn with_nonce_store(store: Arc<dyn NonceStore>) -> Self {
+        Self {
+            public_keys: Arc::new(Mutex::new(Vec::new())),
+            nonce_store: store,
         }
     }
 
@@ -80,16 +203,13 @@ impl SignatureVerifier {
 
     pub fn verify(&self, req: &SignedRequest, secret: &str) -> VerificationResult {
         // 1. Validate timestamp
-        if let Err(e) = validate_timestamp(&req.timestamp) {
-            return VerificationResult {
-                valid: false,
-                reason: Some(e),
-            };
-        }
+        let ts = match validate_timestamp(&req.timestamp) {
+            Ok(ts) => ts,
+            Err(e) => return VerificationResult { valid: false, reason: Some(e) },
+        };
 
-        // 2. Check nonce hasn't been used
-        let mut nonces = self.used_nonces.lock().unwrap_or_else(|p| p.into_inner());
-        if nonces.contains(&req.nonce) {
+        // 2. Check nonce hasn't been used (shared across all instances)
+        if !self.nonce_store.check_and_insert(&req.nonce, ts) {
             return VerificationResult {
                 valid: false,
                 reason: Some("nonce already used (replay attack detected)".to_string()),
@@ -109,19 +229,14 @@ impl SignatureVerifier {
         let algorithm = parse_algorithm(&req.algorithm);
         let expected_sig = match sign_request(&req.body, secret, algorithm) {
             Ok(sig) => sig,
-            Err(e) => {
-                return VerificationResult {
-                    valid: false,
-                    reason: Some(e),
-                };
-            }
+            Err(e) => return VerificationResult { valid: false, reason: Some(e) },
         };
 
         let valid = constant_time_eq(req.signature.as_bytes(), expected_sig.as_bytes());
 
-        if valid {
-            nonces.insert(req.nonce.clone());
-        }
+        // If the signature turned out to be invalid the nonce was already
+        // recorded, which is intentional: an attacker replaying a request with
+        // a bad signature should not get a second attempt with the same nonce.
 
         VerificationResult {
             valid,
@@ -198,7 +313,8 @@ fn parse_algorithm(algo_str: &Option<String>) -> SigningAlgorithm {
 
 pub const MAX_TIMESTAMP_DRIFT_SECS: i64 = 300;
 
-pub fn validate_timestamp(timestamp_str: &str) -> Result<(), String> {
+/// Validate the timestamp and return its parsed value on success.
+pub fn validate_timestamp(timestamp_str: &str) -> Result<i64, String> {
     let ts: i64 = timestamp_str
         .parse()
         .map_err(|_| format!("invalid timestamp: {timestamp_str}"))?;
@@ -212,7 +328,7 @@ pub fn validate_timestamp(timestamp_str: &str) -> Result<(), String> {
         ));
     }
 
-    Ok(())
+    Ok(ts)
 }
 
 // ── Constant-time comparison ──────────────────────────────────────────────────
@@ -536,5 +652,160 @@ mod tests {
         assert_eq!(keys.len(), 2, "should have 2 public keys");
         assert!(keys.contains(&"key-1".to_string()));
         assert!(keys.contains(&"key-2".to_string()));
+    }
+
+    // ── Nonce pruning ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn expired_nonces_are_pruned_and_reusable() {
+        // Insert a nonce as if it arrived NONCE_TTL_SECS ago (i.e. just expired).
+        let store = InProcessNonceStore::new();
+        let now = Utc::now().timestamp();
+        let nonce = "prunable-nonce";
+
+        // Directly seed an expired entry.
+        {
+            let mut map = store.entries.lock().unwrap();
+            map.insert(nonce.to_owned(), now - NONCE_TTL_SECS);
+        }
+
+        // check_and_insert should prune the stale entry and accept the nonce.
+        assert!(
+            store.check_and_insert(nonce, now),
+            "expired nonce should be pruned and accepted"
+        );
+    }
+
+    #[test]
+    fn nonce_within_ttl_is_rejected_as_replay() {
+        let store = InProcessNonceStore::new();
+        let now = Utc::now().timestamp();
+        let nonce = "live-nonce";
+
+        // Insert a nonce that is still within the TTL window.
+        {
+            let mut map = store.entries.lock().unwrap();
+            map.insert(nonce.to_owned(), now - (NONCE_TTL_SECS / 2));
+        }
+
+        assert!(
+            !store.check_and_insert(nonce, now),
+            "nonce within TTL should be rejected as replay"
+        );
+    }
+
+    #[test]
+    fn in_process_store_memory_stays_bounded() {
+        // Insert many entries that all expired, then add one live entry.
+        // After the call the map should contain only the live entry.
+        let store = InProcessNonceStore::new();
+        let now = Utc::now().timestamp();
+
+        {
+            let mut map = store.entries.lock().unwrap();
+            for i in 0..1000 {
+                map.insert(format!("old-{i}"), now - NONCE_TTL_SECS - 1);
+            }
+        }
+
+        store.check_and_insert("new-nonce", now);
+
+        let map = store.entries.lock().unwrap();
+        assert_eq!(map.len(), 1, "only the live nonce should remain after pruning");
+    }
+
+    // ── Multi-instance replay test ────────────────────────────────────────────
+
+    /// Two `SignatureVerifier` instances share the same `InProcessNonceStore`
+    /// (simulating a shared backing store).  A request accepted by instance A
+    /// must be rejected as a replay by instance B.
+    #[test]
+    fn shared_store_prevents_cross_instance_replay() {
+        let shared_store: Arc<dyn NonceStore> = Arc::new(InProcessNonceStore::new());
+
+        let instance_a = SignatureVerifier::with_nonce_store(Arc::clone(&shared_store));
+        let instance_b = SignatureVerifier::with_nonce_store(Arc::clone(&shared_store));
+
+        let body = r#"{"action":"cross-instance-transfer","amount":250}"#;
+        let secret = "shared-secret";
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let timestamp = current_timestamp_str();
+
+        let sig = sign_request(body, secret, SigningAlgorithm::Sha256)
+            .expect("signing should succeed");
+
+        let req_a = SignedRequest {
+            body: body.to_string(),
+            signature: sig.clone(),
+            timestamp: timestamp.clone(),
+            nonce: nonce.clone(),
+            algorithm: Some("sha256".to_string()),
+        };
+
+        // Instance A processes the request first — must succeed.
+        let result_a = instance_a.verify(&req_a, secret);
+        assert!(
+            result_a.valid,
+            "instance A should accept the original request: {:?}",
+            result_a.reason
+        );
+
+        // Instance B sees the same nonce — must be rejected as a replay.
+        let req_b = SignedRequest {
+            body: body.to_string(),
+            signature: sig,
+            timestamp,
+            nonce,
+            algorithm: Some("sha256".to_string()),
+        };
+        let result_b = instance_b.verify(&req_b, secret);
+        assert!(
+            !result_b.valid,
+            "instance B should reject the replayed request"
+        );
+        assert!(
+            result_b
+                .reason
+                .as_ref()
+                .expect("reason should be present")
+                .contains("replay"),
+            "rejection reason should mention replay"
+        );
+    }
+
+    /// Two independent `SignatureVerifier` instances backed by *separate*
+    /// in-process stores (the old, broken behaviour) each accept the same
+    /// nonce.  This test documents the bug that `shared_store_prevents_cross_instance_replay`
+    /// fixes.
+    #[test]
+    fn independent_stores_do_not_share_nonce_state() {
+        let instance_a = SignatureVerifier::new(); // own store
+        let instance_b = SignatureVerifier::new(); // own store — isolated
+
+        let body = r#"{"action":"test"}"#;
+        let secret = "key";
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let timestamp = current_timestamp_str();
+
+        let sig = sign_request(body, secret, SigningAlgorithm::Sha256)
+            .expect("signing should succeed");
+
+        let make_req = || SignedRequest {
+            body: body.to_string(),
+            signature: sig.clone(),
+            timestamp: timestamp.clone(),
+            nonce: nonce.clone(),
+            algorithm: Some("sha256".to_string()),
+        };
+
+        let result_a = instance_a.verify(&make_req(), secret);
+        let result_b = instance_b.verify(&make_req(), secret);
+
+        // Both accept — this is the known limitation of per-process storage.
+        assert!(result_a.valid, "instance A should accept");
+        assert!(
+            result_b.valid,
+            "instance B also accepts (isolated store — expected without shared backing)"
+        );
     }
 }

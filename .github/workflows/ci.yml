@@ -69,6 +69,14 @@ jobs:
       - name: Build backend
         run: cargo build --package ethos-protocol-backend
 
+      # Issue #964: generate the module reference docs cited by
+      # docs/documentation-generation.md. Output is gitignored and
+      # regenerated on every CI run.
+      - name: Generate module reference docs
+        run: |
+          cargo run --package ethos-protocol-backend --bin doc_generator -- \
+            --module feature_flags --output docs/generated/feature_flags.md
+
       # Build the deployable artifact before tests so the upgrade simulation
       # can install and replace a real Soroban WASM contract.
       - name: Build WASM artifact
@@ -136,6 +144,11 @@ jobs:
           python3 -m pip install --quiet pyyaml
           python3 scripts/test_check_compose_bind_mounts.py
           python3 scripts/check_compose_bind_mounts.py
+
+      - name: Check alert rule runbook links
+        run: |
+          python3 scripts/test_check_alert_runbooks.py
+          python3 scripts/check_alert_runbooks.py
 
       # Issues #580-#583: the ZK guide, API docs, deployment runbook and
       # troubleshooting guide are validated against the source tree so they

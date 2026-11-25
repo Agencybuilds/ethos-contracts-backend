@@ -122,7 +122,7 @@ Create an `INCIDENT_RESPONSE.md` document covering detection, containment, eradi
 | `iso27001.a9_1_access_control_policy` | Access Control Policy (A.9.1) | Pass |
 | `iso27001.a9_4_app_access_control` | Application Access Control (A.9.4) | Pass |
 | `iso27001.a10_1_cryptographic_controls` | Cryptographic Controls (A.10.1) | Pass |
-| `iso27001.a12_1_operational_procedures` | Operational Procedures (A.12.1) | Warning |
+| `iso27001.a12_1_operational_procedures` | [Operational Procedures (A.12.1)](operations.md) | Pass |
 | `iso27001.a12_4_logging` | Logging & Monitoring (A.12.4) | Pass |
 | `iso27001.a12_6_vulnerability_management` | Vulnerability Management (A.12.6) | Warning |
 | `iso27001.a14_2_secure_development` | Security in Development (A.14.2) | Pass |
@@ -130,9 +130,6 @@ Create an `INCIDENT_RESPONSE.md` document covering detection, containment, eradi
 | `iso27001.a18_1_legal_compliance` | Legal & Contractual Compliance (A.18.1) | Not Applicable |
 
 ### Key ISO 27001 Remediation Items
-
-**Operational Procedures (Warning)**  
-Create `docs/operations.md` covering key-rotation procedures, backup schedules, restore drills, and on-call contacts.
 
 **Vulnerability Management (Warning)**  
 Add a `cargo audit` step to the CI workflow and configure Dependabot or RenovateBot to open PRs for dependency updates.
@@ -178,6 +175,7 @@ let pdf = generate_pdf_report(&chrono::Utc::now(), &checks);
 
 ## Related Documentation
 
+- [Operations Runbook](operations.md)
 - [Threat Model & Security](security.md)
 - [Security Policy & Vulnerability Disclosure](../SECURITY.md)
 - [Secret Scanning](secret-scanning.md)

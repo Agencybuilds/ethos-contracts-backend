@@ -54,6 +54,7 @@ groups:
 
       - alert: EthosContractUpgradeInProgress
         expr: increase(ethos_protocol_contract_upgrade_events_total[10m]) > 0
+        for: 1m
         labels:
           severity: warning
         annotations:
@@ -63,6 +64,7 @@ groups:
 
       - alert: EthosCredentialLifecycleAnomalies
         expr: increase(ethos_protocol_credential_lifecycle_errors_total[15m]) > 10
+        for: 5m
         labels:
           severity: warning
         annotations:
@@ -101,11 +103,12 @@ groups:
     rules:
       - alert: EthosCanaryRollbackTriggered
         expr: increase(ethos_protocol_canary_rollbacks_total[10m]) > 0
+        for: 1m
         labels:
           severity: critical
         annotations:
           summary: "Canary deployment rolled back automatically"
-          description: "A canary deployment for {{ $labels.service }} was rolled back due to metric thresholds being breached. See docs/runary-deployments.md and docs/runbook-alerts.md#ethoscanaryrollback"
+          description: "A canary deployment for {{ $labels.service }} was rolled back due to metric thresholds being breached. See docs/canary-deployments.md and docs/runbook-alerts.md#ethoscanaryrollback"
           runbook: "docs/runbook-alerts.md#ethoscanaryrollback"
 
       - alert: EthosCanaryHighErrorRate
@@ -133,6 +136,7 @@ groups:
 
       - alert: EthosBlueGreenRollbackTriggered
         expr: increase(ethos_protocol_bluegreen_rollbacks_total[10m]) > 0
+        for: 1m
         labels:
           severity: critical
         annotations:
@@ -145,6 +149,7 @@ groups:
     rules:
       - alert: EthosDeploymentAutoRolledBack
         expr: increase(ethos_protocol_deployment_rollbacks_total[10m]) > 0
+        for: 1m
         labels:
           severity: critical
         annotations:
