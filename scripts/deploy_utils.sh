@@ -34,6 +34,14 @@ FORCE_DEPLOY=false
 # with "$@" from the top-level deploy script. Leaves DRY_RUN/FORCE_DEPLOY set
 # as globals for the rest of the script to consult.
 parse_common_flags() {
+  # Environment override: DRY_RUN=1 (or "true") enables dry-run.
+  if [[ "${DRY_RUN_ENV:-}" == "1" || "${DRY_RUN_ENV:-}" == "true" ]]; then
+    DRY_RUN=true
+  fi
+  if [[ "${DRY_RUN:-}" == "1" ]]; then
+    DRY_RUN=true
+  fi
+
   for arg in "$@"; do
     case "$arg" in
       --dry-run)
@@ -45,10 +53,8 @@ parse_common_flags() {
     esac
   done
 
-  if [[ "${DRY_RUN_ENV:-${DRY_RUN:-}}" == "1" || "${DRY_RUN}" == "true" && -n "${DRY_RUN_ENV:-}" ]]; then
-    DRY_RUN=true
-  fi
-  if [[ "${DRY_RUN}" != "true" && "${DRY_RUN}" != "false" ]]; then
+  # Normalize to exactly "true" or "false".
+  if [[ "$DRY_RUN" != "true" ]]; then
     DRY_RUN=false
   fi
 }
@@ -133,7 +139,9 @@ get_contract_address() {
   grep -A 1 "\[${network}\]" environments.toml | grep "contract_ttl_vault" | cut -d'"' -f2
 }
 
-# Update contract address in environments.toml for given network
+# Update contract address in environments.toml for given network.
+# Fails loudly if the network section or key is missing, rather than silently
+# leaving environments.toml unchanged.
 set_contract_address() {
   local network=$1
   local contract_id=$2
@@ -143,15 +151,26 @@ set_contract_address() {
     return 0
   fi
 
-  local temp_file=$(mktemp)
+  if ! grep -q "^\[${network}\]" environments.toml; then
+    echo "error: section [$network] not found in environments.toml" >&2
+    return 1
+  fi
+
+  local temp_file
+  temp_file=$(mktemp)
 
   awk -v net="$network" -v cid="$contract_id" '
-    BEGIN { found = 0 }
-    /^\['"$network"'\]/ { found = 1; print; next }
-    found && /^contract_ttl_vault/ { print "contract_ttl_vault = \"" cid "\""; found = 0; next }
+    BEGIN { found = 0; updated = 0 }
+    $0 == "[" net "]" { found = 1; print; next }
+    found && /^contract_ttl_vault/ { print "contract_ttl_vault = \"" cid "\""; found = 0; updated = 1; next }
     found && /^\[/ { found = 0 }
     { print }
-  ' environments.toml > "$temp_file"
+    END { if (!updated) exit 2 }
+  ' environments.toml > "$temp_file" || {
+    rm -f "$temp_file"
+    echo "error: contract_ttl_vault key not found under [$network]" >&2
+    return 1
+  }
 
   mv "$temp_file" environments.toml
 }
