@@ -108,7 +108,7 @@ groups:
           severity: critical
         annotations:
           summary: "Canary deployment rolled back automatically"
-          description: "A canary deployment for {{ $labels.service }} was rolled back due to metric thresholds being breached. See docs/runary-deployments.md and docs/runbook-alerts.md#ethoscanaryrollback"
+          description: "A canary deployment for {{ $labels.service }} was rolled back due to metric thresholds being breached. See docs/canary-deployments.md and docs/runbook-alerts.md#ethoscanaryrollback"
           runbook: "docs/runbook-alerts.md#ethoscanaryrollback"
 
       - alert: EthosCanaryHighErrorRate

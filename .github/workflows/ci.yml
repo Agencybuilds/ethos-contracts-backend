@@ -145,6 +145,11 @@ jobs:
           python3 scripts/test_check_compose_bind_mounts.py
           python3 scripts/check_compose_bind_mounts.py
 
+      - name: Check alert rule runbook links
+        run: |
+          python3 scripts/test_check_alert_runbooks.py
+          python3 scripts/check_alert_runbooks.py
+
       # Issues #580-#583: the ZK guide, API docs, deployment runbook and
       # troubleshooting guide are validated against the source tree so they
       # cannot silently drift from the code they describe.
