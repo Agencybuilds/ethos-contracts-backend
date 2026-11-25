@@ -1,5 +1,9 @@
 target/
 
+# Generated module reference docs (see docs/documentation-generation.md).
+# Regenerated on each CI run by the doc_generator bin.
+docs/generated/
+
 # Test snapshots and fuzz artifacts
 **/__snapshots__/
 *.snap

@@ -69,6 +69,14 @@ jobs:
       - name: Build backend
         run: cargo build --package ethos-protocol-backend
 
+      # Issue #964: generate the module reference docs cited by
+      # docs/documentation-generation.md. Output is gitignored and
+      # regenerated on every CI run.
+      - name: Generate module reference docs
+        run: |
+          cargo run --package ethos-protocol-backend --bin doc_generator -- \
+            --module feature_flags --output docs/generated/feature_flags.md
+
       # Build the deployable artifact before tests so the upgrade simulation
       # can install and replace a real Soroban WASM contract.
       - name: Build WASM artifact
